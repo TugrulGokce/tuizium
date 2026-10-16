@@ -71,7 +71,7 @@ Expand-Archive tuizium-v1.0.0-x86_64-pc-windows-msvc.zip .
 **From source:**
 
 ```sh
-git clone <repository-url> tuizium && cd tuizium
+git clone https://github.com/TugrulGokce/tuizium.git && cd tuizium
 cargo install --path .
 ```
 
