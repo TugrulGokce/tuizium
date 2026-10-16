@@ -33,8 +33,13 @@ struct Bitmap {
 
 fn decode(data: &[u8]) -> Bitmap {
     let (w, h) = (usize::from(data[0]), usize::from(data[1]));
-    let px =
-        data[2..].chunks_exact(4).take(w * h).map(|p| (p[3] > 0).then_some((p[0], p[1], p[2]))).collect();
+    let px = data[2..]
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .take(w * h)
+        .map(|p| (p[3] > 0).then_some((p[0], p[1], p[2])))
+        .collect();
     Bitmap { w, h, px }
 }
 
