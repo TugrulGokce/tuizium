@@ -1,0 +1,30 @@
+[package]
+name = "tuizium"
+version = "1.0.0"
+edition = "2024"
+description = "A fast terminal interface for Debezium and Kafka Connect"
+license = "MIT"
+readme = "README.md"
+keywords = ["kafka", "debezium", "tui", "kafka-connect"]
+categories = ["command-line-utilities"]
+
+[dependencies]
+anyhow = "1.0.104"
+chrono = { version = "0.4.45", default-features = false, features = ["clock", "std"] }
+dirs = "7.0.0"
+futures = "0.3.34"
+ratatui = "0.30.2"
+reqwest = { version = "0.13.5", default-features = false, features = ["json", "query", "rustls"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+tokio = { version = "1.53.2", features = ["rt-multi-thread", "macros", "sync", "time", "signal"] }
+toml = "1.1.8"
+tracing = "0.1.44"
+tracing-appender = "0.2.5"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"

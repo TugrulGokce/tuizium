@@ -1,0 +1,18 @@
+# Sample Tuizium config. Copy to the config location (see README) or pass it with --config.
+# Passwords and tokens are never stored here: *_env holds the NAME of an environment variable.
+default_cluster = "local"
+refresh_secs = 5
+ask_on_start = true            # false = skip the connection screen and connect to default_cluster
+
+[clusters.local]
+url = "http://localhost:8083"
+
+[clusters.staging]
+url = "https://connect.example.com"
+username = "admin"
+password_env = "STAGING_CONNECT_PASSWORD"
+
+[clusters.cloud]
+url = "https://connect.example.org"
+token_env = "CLOUD_CONNECT_TOKEN"
+timeout_secs = 15

@@ -1,0 +1,11 @@
+# Debezium Connect + the Debezium JDBC sink plugin, so you can try source AND sink connectors.
+ARG DEBEZIUM_VERSION=3.0.8.Final
+FROM quay.io/debezium/connect:${DEBEZIUM_VERSION}
+ARG DEBEZIUM_VERSION
+USER root
+RUN curl -fsSL -o /tmp/jdbc.tar.gz \
+      https://repo1.maven.org/maven2/io/debezium/debezium-connector-jdbc/${DEBEZIUM_VERSION}/debezium-connector-jdbc-${DEBEZIUM_VERSION}-plugin.tar.gz \
+ && tar -xzf /tmp/jdbc.tar.gz -C /kafka/connect \
+ && rm /tmp/jdbc.tar.gz \
+ && chown -R kafka:kafka /kafka/connect
+USER kafka
