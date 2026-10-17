@@ -1666,6 +1666,16 @@ pub fn trace_matches(rows: &[TraceRow], query: &str) -> Vec<usize> {
 
 /// Reads a connector definition from a file path, or inline JSON if the input
 /// starts with `{`.
+/// On Windows, characters typed with AltGr (`\`, `{`, `}`, `[` on many layouts)
+/// arrive as Ctrl+Alt+char. Treat them as plain characters so text fields accept them.
+pub fn normalize_altgr(mut key: KeyEvent) -> KeyEvent {
+    let altgr = KeyModifiers::CONTROL | KeyModifiers::ALT;
+    if matches!(key.code, KeyCode::Char(_)) && key.modifiers.contains(altgr) {
+        key.modifiers.remove(altgr);
+    }
+    key
+}
+
 pub fn load_json(input: &str) -> Result<(String, Map<String, Value>), String> {
     let input = input.trim();
     if input.is_empty() {
@@ -1749,6 +1759,14 @@ mod tests {
     use super::*;
     use crate::api::{Snapshot, Task};
     use tokio::sync::mpsc::unbounded_channel;
+
+    #[test]
+    fn altgr_characters_become_plain_characters() {
+        let altgr = KeyEvent::new(KeyCode::Char('\\'), KeyModifiers::CONTROL | KeyModifiers::ALT);
+        assert_eq!(normalize_altgr(altgr).modifiers, KeyModifiers::NONE);
+        let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        assert_eq!(normalize_altgr(ctrl_c).modifiers, KeyModifiers::CONTROL);
+    }
 
     fn conn(name: &str, kind: Kind, state: &str, tasks: &[&str]) -> Connector {
         Connector {

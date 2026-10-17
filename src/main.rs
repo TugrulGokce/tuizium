@@ -169,7 +169,7 @@ fn spawn_background(tx: UnboundedSender<Msg>) {
             }
             let Ok(ev) = event::read() else { break };
             let msg = match ev {
-                Event::Key(k) if k.kind != KeyEventKind::Release => Msg::Key(k),
+                Event::Key(k) if k.kind != KeyEventKind::Release => Msg::Key(app::normalize_altgr(k)),
                 Event::Resize(..) => Msg::Redraw,
                 _ => continue,
             };

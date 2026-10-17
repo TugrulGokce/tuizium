@@ -26,7 +26,11 @@ Non-interactive subcommands, for scripts and CI. No terminal is needed; output i
   does not exist and `create` one that does; neither sends anything when validation fails; an `update` that changes nothing sends nothing.
   `delete` is deliberately not available outside the UI.
 - Cluster selection is the same as for the UI: `--url`, `--cluster`, `--config`, else `default_cluster` or the first profile.
-- Changed: argument errors now exit with code 2 (they were 1).
+- Changed: argument errors now exit with code 2 (they were 1). `--url` must start with `http://` or `https://`, so an empty shell variable gives a clear error instead of swallowing the next argument.
+- `list` marks a connector whose state is RUNNING but has a failed task as `RUNNING (task failed)`.
+- Known limit: `--wait` after `update` can report `confirmed` early, because the connector is already RUNNING before the new config has produced any effect.
+- Fix (UI, found in manual testing): on Windows, characters typed with AltGr (`\`, `{`, `}`, `[` on Turkish and many other layouts) arrive as Ctrl+Alt+character and
+  were dropped by every text field, so a Windows path pasted into the `n` box lost its backslashes. They are now treated as plain characters.
 - Tests: 7 end-to-end tests (`tests/cli.rs`) run the real binary against a small fake Kafka Connect; argument parsing is unit-tested.
 
 ## 1.1.0 — safety and usability (roadmap v1.1)

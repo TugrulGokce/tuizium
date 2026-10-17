@@ -110,7 +110,16 @@ pub fn parse(args: &[String]) -> Result<Parsed, String> {
             "-h" | "--help" => return Ok(Parsed::Help),
             "-V" | "--version" => return Ok(Parsed::Version),
             "-c" | "--cluster" => global.cluster = Some(value("--cluster")?),
-            "-u" | "--url" => global.url = Some(value("--url")?),
+            "-u" | "--url" => {
+                let v = value("--url")?;
+                // An empty shell variable makes the next word (often the subcommand) the value.
+                if !(v.starts_with("http://") || v.starts_with("https://")) {
+                    return Err(format!(
+                        "--url expects an http:// or https:// address, got {v:?} (is a shell variable empty?)"
+                    ));
+                }
+                global.url = Some(v);
+            }
             "--config" => global.config = Some(value("--config")?.into()),
             "--no-splash" => global.no_splash = true,
             "-o" | "--output" => {
@@ -362,7 +371,12 @@ async fn list(
                     [
                         safe(&c.name),
                         c.kind.label().to_string(),
-                        safe(&c.state),
+                        // A RUNNING connector with a failed task must not look healthy in a table.
+                        if c.is_failed() && c.state != "FAILED" {
+                            format!("{} (task failed)", safe(&c.state))
+                        } else {
+                            safe(&c.state)
+                        },
                         format!("{}/{}", c.running_tasks(), c.tasks.len()),
                         safe(&c.class),
                     ]
@@ -536,11 +550,10 @@ async fn mutate(
                 if r["accepted"] == false {
                     println!("{verb} {n}: FAILED — {}", r["error"].as_str().unwrap_or(""));
                 } else {
-                    println!(
-                        "{verb} {n}: {} — {}",
-                        r["verified"].as_str().unwrap_or(""),
-                        r["detail"].as_str().unwrap_or("")
-                    );
+                    let detail = r["detail"].as_str().unwrap_or("");
+                    // The judge's sentence starts with the connector name, which is already on this line.
+                    let detail = detail.strip_prefix(&format!("{n}: ")).unwrap_or(detail);
+                    println!("{verb} {n}: {} — {detail}", r["verified"].as_str().unwrap_or(""));
                 }
             }
         }
@@ -679,7 +692,8 @@ async fn apply_definition(
             if apply {
                 println!("sent to Kafka Connect");
                 for v in &verified {
-                    println!("{}: {} — {}", v.name, v.status, v.detail);
+                    let detail = v.detail.strip_prefix(&format!("{}: ", v.name)).unwrap_or(&v.detail);
+                    println!("{}: {} — {detail}", v.name, v.status);
                 }
                 if verified.is_empty() {
                     println!("not verified (use --wait to confirm the connector becomes healthy)");
@@ -766,6 +780,7 @@ mod tests {
             (vec!["list", "--state", "weird"], "--state must be"),
             (vec!["--bogus"], "unknown argument"),
             (vec!["--url"], "requires a value"),
+            (vec!["--url", "list", "--state", "failed"], "--url expects an http://"),
             (vec!["--no-splash=1"], "does not take a value"),
         ] {
             let e = p(&args).unwrap_err();

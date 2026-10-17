@@ -182,6 +182,11 @@ fn list_table_and_json() {
     no_escape_codes(&o);
     assert!(o.stdout.starts_with("NAME"), "{}", o.stdout);
     assert!(o.stdout.contains("PAUSED") && o.stdout.contains("x.Sink"));
+    let failed_row = o.stdout.lines().find(|l| l.starts_with("f ")).expect("row for f");
+    assert!(
+        failed_row.contains("RUNNING (task failed)"),
+        "a failed task must show in the table: {failed_row}"
+    );
 
     let o = tuizium(&f, &["list", "--output", "json"]);
     let v: serde_json::Value = serde_json::from_str(&o.stdout).unwrap();
