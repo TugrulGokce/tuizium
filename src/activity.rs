@@ -125,6 +125,8 @@ pub fn default_path() -> Option<PathBuf> {
 pub enum Expect {
     Paused,
     Running,
+    /// A just-created connector: it may legitimately be missing from the first snapshots.
+    Created,
     /// Went through a non-running state and came back (or is healthy after the grace period).
     Restarted,
     Gone,
@@ -172,6 +174,14 @@ pub fn judge(w: &mut Watch, c: Option<&Connector>, elapsed: Duration) -> Option<
     let Some(c) = c else {
         return Some(match w.expect {
             Expect::Gone => (Severity::Ok, format!("{n}: deleted — no longer listed")),
+            Expect::Created => {
+                return timed_out.then(|| {
+                    (
+                        Severity::Warn,
+                        format!("{n}: created, but still not listed after {}s", elapsed.as_secs()),
+                    )
+                });
+            }
             _ => (Severity::Warn, format!("{n}: not listed on the cluster any more")),
         });
     };
@@ -201,6 +211,15 @@ pub fn judge(w: &mut Watch, c: Option<&Connector>, elapsed: Duration) -> Option<
                     )
                 })
             }
+        }
+        Expect::Created => {
+            if settled(c) {
+                return Some((Severity::Ok, format!("{n}: created — confirmed {}", describe(c))));
+            }
+            let sev = if c.is_failed() { Severity::Error } else { Severity::Warn };
+            timed_out.then(|| {
+                (sev, format!("{n}: created, but not healthy after {}s — {}", elapsed.as_secs(), describe(c)))
+            })
         }
         Expect::Restarted => {
             if let Some(s) = transitional(c) {
@@ -318,6 +337,26 @@ mod tests {
         // A connector that vanished while we waited for something else is flagged.
         let mut w = Watch::new("c".into(), Expect::Paused);
         assert_eq!(judge(&mut w, None, secs(1)).unwrap().0, Severity::Warn);
+    }
+
+    #[test]
+    fn created_connector_is_awaited_instead_of_flagged_as_missing() {
+        let mut w = Watch::new("c".into(), Expect::Created);
+        assert!(judge(&mut w, None, secs(1)).is_none(), "not listed yet is normal right after a create");
+        assert!(judge(&mut w, Some(&conn("RUNNING", &["UNASSIGNED"])), secs(2)).is_none());
+        let (sev, msg) = judge(&mut w, Some(&conn("RUNNING", &["RUNNING"])), secs(3)).unwrap();
+        assert_eq!(sev, Severity::Ok);
+        assert!(msg.contains("created"), "{msg}");
+
+        let mut w = Watch::new("c".into(), Expect::Created);
+        let (sev, msg) = judge(&mut w, None, WATCH_TIMEOUT).unwrap();
+        assert_eq!(sev, Severity::Warn);
+        assert!(msg.contains("not listed"), "{msg}");
+
+        let mut w = Watch::new("c".into(), Expect::Created);
+        let (sev, msg) = judge(&mut w, Some(&conn("RUNNING", &["FAILED"])), WATCH_TIMEOUT).unwrap();
+        assert_eq!(sev, Severity::Error);
+        assert!(msg.contains("FAILED"), "{msg}");
     }
 
     #[test]

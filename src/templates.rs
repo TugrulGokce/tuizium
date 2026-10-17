@@ -2,6 +2,8 @@
 
 use serde_json::{Map, Value};
 
+use crate::api::Plugin;
+
 pub struct FieldDef {
     /// Config key, or the special key `name` for the connector name.
     pub key: &'static str,
@@ -68,8 +70,26 @@ pub const TEMPLATES: &[Template] = &[
         ],
     },
     Template {
-        title: "JDBC Sink",
-        description: "Write Kafka topics to a relational database (Confluent JDBC sink)",
+        title: "Debezium JDBC Sink",
+        description: "Write Kafka topics to a relational database (Debezium JDBC sink)",
+        fixed: &[
+            ("connector.class", "io.debezium.connector.jdbc.JdbcSinkConnector"),
+            ("insert.mode", "upsert"),
+            ("primary.key.mode", "record_key"),
+            ("schema.evolution", "basic"),
+        ],
+        fields: &[
+            f("name", "Connector name", "jdbc-sink"),
+            f("topics", "Topics (comma separated)", ""),
+            f("connection.url", "JDBC URL", "jdbc:postgresql://localhost:5432/postgres"),
+            f("connection.username", "Database user", "postgres"),
+            secret("connection.password", "Database password"),
+            f("tasks.max", "Max tasks", "1"),
+        ],
+    },
+    Template {
+        title: "Confluent JDBC Sink",
+        description: "Write Kafka topics to a relational database (Confluent JDBC sink, must be installed)",
         fixed: &[
             ("connector.class", "io.confluent.connect.jdbc.JdbcSinkConnector"),
             ("insert.mode", "upsert"),
@@ -87,6 +107,32 @@ pub const TEMPLATES: &[Template] = &[
         ],
     },
 ];
+
+impl Template {
+    /// The `connector.class` this template creates.
+    pub fn class(&self) -> &'static str {
+        self.fixed.iter().find(|(k, _)| *k == "connector.class").map_or("", |(_, v)| v)
+    }
+}
+
+/// Whether the cluster reported the plugin a template needs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Availability {
+    Installed,
+    Missing,
+    /// The plugin list is not known (yet), so nothing is claimed.
+    Unknown,
+}
+
+pub fn availability(t: &Template, plugins: &[Plugin]) -> Availability {
+    if plugins.is_empty() {
+        Availability::Unknown
+    } else if plugins.iter().any(|p| p.class == t.class()) {
+        Availability::Installed
+    } else {
+        Availability::Missing
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct FieldState {
@@ -138,27 +184,74 @@ impl FormState {
         if name.is_empty() {
             return Err("connector name is required".into());
         }
-        if t.title == "JDBC Sink" && !cfg.contains_key("topics") {
+        if t.fields.iter().any(|f| f.key == "topics") && !cfg.contains_key("topics") {
             return Err("at least one topic is required".into());
         }
         Ok((name, cfg))
     }
 }
 
+/// Key-name fragments that mark a config value as a secret.
+const SECRET_KEYS: [&str; 9] =
+    ["password", "passwd", "secret", "token", "credential", "api.key", "apikey", "private.key", "jaas"];
+/// URL / connection-string parameters whose value is a secret (`...?password=x&ssl=true`).
+const SECRET_PARAMS: [&str; 5] = ["password=", "passwd=", "pwd=", "secret=", "token="];
+const MASK: &str = "********";
+
+fn is_secret_key(key: &str) -> bool {
+    let lk = key.to_ascii_lowercase();
+    SECRET_KEYS.iter().any(|s| lk.contains(s))
+}
+
+/// Replaces the value of secret-looking `name=value` parameters inside a string.
+fn mask_params(s: &str) -> String {
+    let lower = s.to_ascii_lowercase();
+    let mut out = String::with_capacity(s.len());
+    let mut i = 0;
+    while i < s.len() {
+        match SECRET_PARAMS.iter().find(|p| lower[i..].starts_with(*p)) {
+            Some(p) => {
+                let value_start = i + p.len();
+                let end = s[value_start..]
+                    .find(['&', ';', ' ', '"', '\'', '\n', '\r', '\t'])
+                    .map_or(s.len(), |n| value_start + n);
+                out.push_str(&s[i..value_start]);
+                out.push_str(MASK);
+                i = end;
+            }
+            None => {
+                let ch = s[i..].chars().next().unwrap_or(' ');
+                out.push(ch);
+                i += ch.len_utf8();
+            }
+        }
+    }
+    out
+}
+
 /// Returns a copy of the config with secret-looking values masked, for display.
+/// Config-provider references such as `${env:VAR}` are not secrets and stay visible.
 pub fn masked(cfg: &Map<String, Value>) -> Map<String, Value> {
     cfg.iter()
         .map(|(k, v)| {
-            let lk = k.to_ascii_lowercase();
-            let sensitive = ["password", "secret", "token", "credential"].iter().any(|s| lk.contains(s));
-            let v = if sensitive && !v.as_str().is_some_and(|s| s.starts_with("${")) {
-                Value::String("********".into())
+            let reference = v.as_str().is_some_and(|s| s.starts_with("${"));
+            let v = if reference {
+                v.clone()
+            } else if is_secret_key(k) {
+                Value::String(MASK.into())
+            } else if let Some(s) = v.as_str() {
+                Value::String(mask_params(s))
             } else {
                 v.clone()
             };
             (k.clone(), v)
         })
         .collect()
+}
+
+/// Masks `name=value` secrets inside one displayed string (e.g. a JDBC URL).
+pub fn mask_text(s: &str) -> String {
+    mask_params(s)
 }
 
 #[cfg(test)]
@@ -169,7 +262,7 @@ mod tests {
     fn every_template_builds_with_defaults() {
         for (i, t) in TEMPLATES.iter().enumerate() {
             let mut form = FormState::new(i);
-            if t.title == "JDBC Sink" {
+            if t.fields.iter().any(|f| f.key == "topics") {
                 form.fields.iter_mut().find(|f| f.key == "topics").unwrap().value = "orders".into();
             }
             let (name, cfg) = form.build().unwrap_or_else(|e| panic!("{}: {e}", t.title));
@@ -200,5 +293,71 @@ mod tests {
         assert_eq!(cfg["database.password"], "hunter2");
         assert_eq!(masked(&cfg)["database.password"], "********");
         assert_eq!(masked(&cfg)["database.user"], "postgres");
+    }
+
+    #[test]
+    fn masks_more_secret_keys_and_url_parameters() {
+        let mut cfg = Map::new();
+        for (k, v) in [
+            ("api.key", "k1"),
+            ("sasl.jaas.config", "org.x.Login required password=\"p\";"),
+            ("connection.url", "jdbc:postgresql://h:5432/db?user=u&password=hunter2&ssl=true"),
+            ("database.hostname", "db.internal"),
+            ("pw.ref", "${env:DB_PW}"),
+            ("database.password", "${file:/run/secrets:pw}"),
+        ] {
+            cfg.insert(k.into(), Value::String(v.into()));
+        }
+        let m = masked(&cfg);
+        assert_eq!(m["api.key"], "********");
+        assert_eq!(m["sasl.jaas.config"], "********");
+        let url = m["connection.url"].as_str().unwrap();
+        assert!(
+            !url.contains("hunter2") && url.contains("password=********") && url.contains("&ssl=true"),
+            "{url}"
+        );
+        assert_eq!(m["database.hostname"], "db.internal");
+        assert_eq!(
+            m["database.password"], "${file:/run/secrets:pw}",
+            "config-provider references stay visible"
+        );
+    }
+
+    fn plugin(class: &str) -> Plugin {
+        Plugin { class: class.into(), kind: "sink".into(), version: "1".into() }
+    }
+
+    fn idx(title: &str) -> usize {
+        TEMPLATES.iter().position(|t| t.title == title).unwrap_or_else(|| panic!("no template {title}"))
+    }
+
+    #[test]
+    fn jdbc_sink_has_separate_debezium_and_confluent_templates() {
+        let build = |title: &str| {
+            let mut form = FormState::new(idx(title));
+            form.fields.iter_mut().find(|f| f.key == "topics").unwrap().value = "orders".into();
+            form.build().unwrap().1
+        };
+        let d = build("Debezium JDBC Sink");
+        assert_eq!(d["connector.class"], "io.debezium.connector.jdbc.JdbcSinkConnector");
+        assert!(d.contains_key("connection.username") && !d.contains_key("connection.user"), "{d:?}");
+        assert_eq!(d["primary.key.mode"], "record_key");
+        assert_eq!(d["schema.evolution"], "basic");
+        let c = build("Confluent JDBC Sink");
+        assert_eq!(c["connector.class"], "io.confluent.connect.jdbc.JdbcSinkConnector");
+        assert!(c.contains_key("connection.user") && c.contains_key("pk.mode"), "{c:?}");
+        for t in ["Debezium JDBC Sink", "Confluent JDBC Sink"] {
+            assert!(FormState::new(idx(t)).build().is_err(), "{t} needs a topic");
+        }
+    }
+
+    #[test]
+    fn availability_follows_the_plugins_the_cluster_reports() {
+        let pg = &TEMPLATES[idx("Debezium PostgreSQL Source")];
+        let confluent = &TEMPLATES[idx("Confluent JDBC Sink")];
+        let installed = [plugin("io.debezium.connector.postgresql.PostgresConnector")];
+        assert_eq!(availability(pg, &installed), Availability::Installed);
+        assert_eq!(availability(confluent, &installed), Availability::Missing);
+        assert_eq!(availability(confluent, &[]), Availability::Unknown, "no plugin list = do not block");
     }
 }

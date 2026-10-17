@@ -1,14 +1,17 @@
 mod activity;
 mod api;
 mod app;
+mod cli;
+mod clip;
 mod config;
+mod diff;
 mod setup;
 mod splash;
 mod templates;
 mod ui;
 
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, ExitCode};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
@@ -17,6 +20,8 @@ use ratatui::DefaultTerminal;
 use ratatui::crossterm::event::{self, Event, KeyEventKind};
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 
+use std::io::IsTerminal;
+
 use app::{App, EditorRequest, Msg};
 use config::{Cluster, Config};
 
@@ -24,15 +29,35 @@ const HELP: &str = "\
 Tuizium - a fast terminal interface for Debezium and Kafka Connect
 
 USAGE:
-    tuizium [OPTIONS]
+    tuizium [OPTIONS]                       open the terminal UI
+    tuizium [OPTIONS] <COMMAND> [ARGS]      run one command and exit (for scripts)
 
 OPTIONS:
-    -c, --cluster <NAME>   Start on the given cluster profile
-    -u, --url <URL>        Connect to an ad-hoc Kafka Connect URL (no auth)
+    -c, --cluster <NAME>   Use the given cluster profile
+    -u, --url <URL>        Use an ad-hoc Kafka Connect URL (no auth)
         --config <PATH>    Use a specific config file
-        --no-splash        Skip the opening animation
+        --no-splash        Skip the opening animation (UI only)
     -h, --help             Print help
     -V, --version          Print version
+
+COMMANDS (plain text or --output json; no colours, no prompts):
+    list [--state S] [--type T]          List connectors (S: running|paused|failed|unassigned, T: source|sink)
+    status <name>                        One connector: state, tasks, masked config and traces
+    pause <name>... [--wait]             Pause connectors
+    resume <name>... [--wait]            Resume connectors
+    restart <name>... [--only-failed] [--wait]
+                                         Restart connectors and their tasks
+    create <file|-> [--dry-run] [--wait]   Create a connector from a JSON file or stdin
+    update <file|-> [--dry-run] [--wait]   Replace a connector's config (shows the diff first)
+
+COMMAND OPTIONS:
+    -o, --output <table|json>   Output format (default table)
+    --wait                      Poll up to 15 s and report whether the change really happened
+    --dry-run                   create/update: validate and show what would change; send nothing
+
+EXIT CODES:
+    0 success   1 error (cannot connect, HTTP error, bad input)   2 usage error
+    3 request accepted but the connector is unhealthy / the change was not confirmed
 
 ENVIRONMENT:
     TUIZIUM_CONFIG         Config file path override
@@ -42,37 +67,6 @@ ENVIRONMENT:
 FILES:
     <state dir>/tuizium/actions.log   Journal of every action and its verified outcome (press L in the app)
 ";
-
-struct Args {
-    cluster: Option<String>,
-    url: Option<String>,
-    config: Option<std::path::PathBuf>,
-    no_splash: bool,
-}
-
-fn parse_args() -> Result<Args> {
-    let mut args = Args { cluster: None, url: None, config: None, no_splash: false };
-    let mut it = std::env::args().skip(1);
-    while let Some(a) = it.next() {
-        let mut val = |name: &str| it.next().ok_or_else(|| anyhow::anyhow!("{name} requires a value"));
-        match a.as_str() {
-            "-h" | "--help" => {
-                print!("{HELP}");
-                std::process::exit(0);
-            }
-            "-V" | "--version" => {
-                println!("tuizium {}", env!("CARGO_PKG_VERSION"));
-                std::process::exit(0);
-            }
-            "-c" | "--cluster" => args.cluster = Some(val("--cluster")?),
-            "-u" | "--url" => args.url = Some(val("--url")?),
-            "--config" => args.config = Some(val("--config")?.into()),
-            "--no-splash" => args.no_splash = true,
-            other => bail!("unknown argument {other:?}\n\n{HELP}"),
-        }
-    }
-    Ok(args)
-}
 
 fn init_logging() -> Option<tracing_appender::non_blocking::WorkerGuard> {
     let filter = std::env::var("TUIZIUM_LOG").ok()?;
@@ -89,8 +83,27 @@ fn init_logging() -> Option<tracing_appender::non_blocking::WorkerGuard> {
 }
 
 #[tokio::main]
-async fn main() -> Result<()> {
-    let args = parse_args()?;
+async fn main() -> Result<ExitCode> {
+    let argv: Vec<String> = std::env::args().skip(1).collect();
+    let args = match cli::parse(&argv) {
+        Ok(cli::Parsed::Help) => {
+            print!("{HELP}");
+            return Ok(ExitCode::SUCCESS);
+        }
+        Ok(cli::Parsed::Version) => {
+            println!("tuizium {}", env!("CARGO_PKG_VERSION"));
+            return Ok(ExitCode::SUCCESS);
+        }
+        Ok(cli::Parsed::Cmd(global, command)) => {
+            let _log_guard = init_logging();
+            return Ok(ExitCode::from(cli::run(global, command).await as u8));
+        }
+        Ok(cli::Parsed::Tui(global)) => global,
+        Err(e) => {
+            eprintln!("error: {e}\n\nRun `tuizium --help` for usage.");
+            return Ok(ExitCode::from(cli::EXIT_USAGE as u8));
+        }
+    };
     let _log_guard = init_logging();
 
     let path = args.config.or_else(config::config_path);
@@ -107,6 +120,14 @@ async fn main() -> Result<()> {
         bail!(
             "unknown cluster {cluster:?}; configured: {}",
             cfg.clusters.keys().cloned().collect::<Vec<_>>().join(", ")
+        );
+    }
+
+    // A TUI writes escape sequences and reads key events; with a pipe or file on either side that is
+    // useless (and would dump control codes into the file), so say so and stop.
+    if !(std::io::stdin().is_terminal() && std::io::stdout().is_terminal()) {
+        bail!(
+            "tuizium needs an interactive terminal (stdin and stdout must be a TTY); run it directly in a terminal"
         );
     }
 
@@ -129,7 +150,7 @@ async fn main() -> Result<()> {
     let mut terminal = ratatui::init();
     let result = run(&mut terminal, &mut app, rx).await;
     ratatui::restore();
-    result
+    result.map(|()| ExitCode::SUCCESS)
 }
 
 fn spawn_background(tx: UnboundedSender<Msg>) {

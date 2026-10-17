@@ -9,8 +9,8 @@ use ratatui::widgets::{Block, Cell, Clear, List, ListItem, Paragraph, Row, Table
 use crate::activity::Severity;
 use crate::api::{Connector, Kind};
 use crate::app::{
-    App, Conn, Focus, Level, Overlay, Panel, Preview, Screen, StateFilter, TypeFilter, Validation,
-    preview_json,
+    App, Conn, Focus, Level, Overlay, Panel, Preview, RowKind, Screen, StateFilter, TypeFilter, Validation,
+    preview_json, trace_matches, trace_rows,
 };
 use crate::templates::TEMPLATES;
 use crate::{setup, splash};
@@ -105,6 +105,21 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
         }
     };
     f.render_widget(Paragraph::new(left), area);
+    // Totals come from the last snapshot of the connector list, nothing else.
+    if area.width >= 110 && !app.connectors.is_empty() {
+        let h = app.health();
+        let mut spans = vec![Span::styled(format!("● {} ok", h.healthy), Style::new().fg(OK))];
+        if h.paused > 0 {
+            spans.push(Span::styled(format!("  ‖ {} paused", h.paused), Style::new().fg(WARN)));
+        }
+        if h.failed > 0 {
+            spans.push(Span::styled(format!("  ✖ {} failed", h.failed), Style::new().fg(ERR)));
+        }
+        if h.other > 0 {
+            spans.push(Span::styled(format!("  ○ {} other", h.other), Style::new().fg(DIM)));
+        }
+        f.render_widget(Paragraph::new(Line::from(spans)).alignment(Alignment::Center), area);
+    }
     f.render_widget(
         Paragraph::new(Line::from(vec![status, Span::raw(" ")])).alignment(Alignment::Right),
         area,
@@ -118,6 +133,53 @@ fn truncate(s: &str, max: usize) -> String {
         let mut t: String = s.chars().take(max.saturating_sub(1)).collect();
         t.push('…');
         t
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Col {
+    Name,
+    Type,
+    State,
+    /// Only the state symbol, for very narrow terminals.
+    Mark,
+    Tasks,
+    Plugin,
+}
+
+impl Col {
+    fn title(self) -> &'static str {
+        match self {
+            Col::Name => "NAME",
+            Col::Type => "TYPE",
+            Col::State => "STATE",
+            Col::Mark => "",
+            Col::Tasks => "TASKS",
+            Col::Plugin => "CONNECTOR PLUGIN",
+        }
+    }
+
+    fn width(self) -> Constraint {
+        match self {
+            Col::Name => Constraint::Fill(2),
+            Col::Type => Constraint::Length(7),
+            Col::State => Constraint::Length(14),
+            Col::Mark => Constraint::Length(1),
+            Col::Tasks => Constraint::Length(6),
+            Col::Plugin => Constraint::Fill(3),
+        }
+    }
+}
+
+/// Columns that fit a list of `width` cells (borders and the `▶ ` marker included in the budget).
+/// The plugin column goes first, then type, then tasks; NAME and STATE are never dropped.
+fn list_columns(width: u16) -> Vec<Col> {
+    match width {
+        90.. => vec![Col::Name, Col::Type, Col::State, Col::Tasks, Col::Plugin],
+        64..90 => vec![Col::Name, Col::Type, Col::State, Col::Tasks],
+        46..64 => vec![Col::Name, Col::State, Col::Tasks],
+        34..46 => vec![Col::Name, Col::State],
+        _ => vec![Col::Name, Col::Mark],
     }
 }
 
@@ -135,6 +197,12 @@ fn draw_list(f: &mut Frame, app: &mut App, area: Rect) {
     }
     if app.state_filter != StateFilter::All {
         tag(format!("state:{}", app.state_filter.label()));
+    }
+    if let Some(w) = &app.worker_filter {
+        tag(format!("worker:{w}"));
+    }
+    if let Some(p) = &app.plugin_filter {
+        tag(format!("plugin:{}", p.rsplit('.').next().unwrap_or(p)));
     }
     if !app.query.is_empty() {
         tag(format!("/{}", app.query));
@@ -162,7 +230,9 @@ fn draw_list(f: &mut Frame, app: &mut App, area: Rect) {
         return;
     }
 
-    let header = Row::new(["NAME", "TYPE", "STATE", "TASKS", "CONNECTOR PLUGIN"])
+    // Narrow terminals drop the least useful columns first; NAME and STATE always stay.
+    let cols = list_columns(area.width);
+    let header = Row::new(cols.iter().map(|c| c.title()).collect::<Vec<_>>())
         .style(Style::new().fg(DIM).add_modifier(Modifier::BOLD));
     let rows: Vec<Row> = app
         .visible
@@ -176,36 +246,37 @@ fn draw_list(f: &mut Frame, app: &mut App, area: Rect) {
                 Kind::Sink => Color::Magenta,
                 Kind::Unknown => DIM,
             };
-            let row = Row::new(vec![
-                Cell::from(if app.marked.contains(&c.name) {
-                    format!("✓ {}", c.name)
-                } else {
-                    c.name.clone()
-                }),
-                Cell::from(c.kind.label()).style(Style::new().fg(kind_color)),
-                Cell::from(format!("{} {}", state_symbol(if failed { "FAILED" } else { &c.state }), c.state))
-                    .style(Style::new().fg(sc)),
-                Cell::from(format!("{}/{}", c.running_tasks(), c.tasks.len())),
-                Cell::from(c.class.clone()).style(Style::new().fg(DIM)),
-            ]);
+            let row = Row::new(
+                cols.iter()
+                    .map(|col| match col {
+                        Col::Name => Cell::from(if app.marked.contains(&c.name) {
+                            format!("✓ {}", c.name)
+                        } else {
+                            c.name.clone()
+                        }),
+                        Col::Type => Cell::from(c.kind.label()).style(Style::new().fg(kind_color)),
+                        Col::State => Cell::from(format!(
+                            "{} {}",
+                            state_symbol(if failed { "FAILED" } else { &c.state }),
+                            c.state
+                        ))
+                        .style(Style::new().fg(sc)),
+                        Col::Mark => Cell::from(state_symbol(if failed { "FAILED" } else { &c.state }))
+                            .style(Style::new().fg(sc)),
+                        Col::Tasks => Cell::from(format!("{}/{}", c.running_tasks(), c.tasks.len())),
+                        Col::Plugin => Cell::from(c.class.clone()).style(Style::new().fg(DIM)),
+                    })
+                    .collect::<Vec<_>>(),
+            );
             if failed { row.style(Style::new().fg(ERR)) } else { row }
         })
         .collect();
-    let table = Table::new(
-        rows,
-        [
-            Constraint::Fill(2),
-            Constraint::Length(7),
-            Constraint::Length(14),
-            Constraint::Length(6),
-            Constraint::Fill(3),
-        ],
-    )
-    .header(header)
-    .block(block)
-    .column_spacing(2)
-    .row_highlight_style(Style::new().add_modifier(Modifier::REVERSED))
-    .highlight_symbol("▶ ");
+    let table = Table::new(rows, cols.iter().map(|c| c.width()).collect::<Vec<_>>())
+        .header(header)
+        .block(block)
+        .column_spacing(2)
+        .row_highlight_style(Style::new().add_modifier(Modifier::REVERSED))
+        .highlight_symbol("▶ ");
     f.render_stateful_widget(table, area, &mut app.table);
 }
 
@@ -241,14 +312,89 @@ fn draw_details(f: &mut Frame, app: &App, area: Rect) {
         ),
         Panel::Tasks => draw_tasks(f, app, c, body),
         Panel::Config => {
-            let json = serde_json::to_string_pretty(&c.config).unwrap_or_default();
+            let json = serde_json::to_string_pretty(&crate::templates::masked(&c.config)).unwrap_or_default();
             f.render_widget(Paragraph::new(json).scroll((app.scroll, 0)), body);
         }
-        Panel::Trace => f.render_widget(
-            Paragraph::new(trace_text(c)).wrap(Wrap { trim: false }).scroll((app.scroll, 0)),
-            body,
-        ),
+        Panel::Trace => draw_trace(f, app, c, body),
     }
+}
+
+fn draw_trace(f: &mut Frame, app: &App, c: &Connector, area: Rect) {
+    let searching = app.trace_searching || !app.trace_query.is_empty();
+    let (body, bar) = if searching && area.height > 1 {
+        let [b, s] = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(area);
+        (b, Some(s))
+    } else {
+        (area, None)
+    };
+    app.trace_width.set(body.width.max(1));
+    let rows = trace_rows(c, body.width as usize);
+    let hits = trace_matches(&rows, &app.trace_query);
+    let q = app.trace_query.to_lowercase();
+    let lines: Vec<Line> = rows
+        .iter()
+        .enumerate()
+        .map(|(i, r)| match r.kind {
+            RowKind::Heading => {
+                Line::styled(r.text.clone(), Style::new().fg(ERR).add_modifier(Modifier::BOLD))
+            }
+            RowKind::Empty => Line::styled(r.text.clone(), Style::new().fg(OK)),
+            RowKind::Line if hits.binary_search(&i).is_ok() => highlight(&r.text, &q),
+            RowKind::Line => Line::raw(r.text.clone()),
+        })
+        .collect();
+    f.render_widget(Paragraph::new(lines).scroll((app.scroll, 0)), body);
+    if let Some(bar) = bar {
+        let cursor = if app.trace_searching { "▌" } else { "" };
+        let info = if app.trace_query.is_empty() {
+            String::new()
+        } else if hits.is_empty() {
+            "  no match".to_string()
+        } else {
+            format!("  {} match row(s) · n/N next/prev · Esc clear", hits.len())
+        };
+        f.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled("/", Style::new().fg(ACCENT).add_modifier(Modifier::BOLD)),
+                Span::raw(app.trace_query.clone()),
+                Span::styled(cursor, Style::new().fg(ACCENT)),
+                Span::styled(info, Style::new().fg(DIM)),
+            ])),
+            bar,
+        );
+    }
+}
+
+/// `text` with every case-insensitive occurrence of the (already lower-cased) `q` highlighted.
+fn highlight(text: &str, q: &str) -> Line<'static> {
+    let chars: Vec<char> = text.chars().collect();
+    let lower: Vec<char> = text.to_lowercase().chars().collect();
+    let qc: Vec<char> = q.chars().collect();
+    // Lower-casing can change the length for exotic characters; then just show the row plainly.
+    if qc.is_empty() || lower.len() != chars.len() {
+        return Line::raw(text.to_string());
+    }
+    let mut spans = Vec::new();
+    let (mut i, mut start) = (0, 0);
+    while i + qc.len() <= chars.len() {
+        if lower[i..i + qc.len()] == qc[..] {
+            if start < i {
+                spans.push(Span::raw(chars[start..i].iter().collect::<String>()));
+            }
+            spans.push(Span::styled(
+                chars[i..i + qc.len()].iter().collect::<String>(),
+                Style::new().fg(Color::Black).bg(WARN),
+            ));
+            i += qc.len();
+            start = i;
+        } else {
+            i += 1;
+        }
+    }
+    if start < chars.len() {
+        spans.push(Span::raw(chars[start..].iter().collect::<String>()));
+    }
+    Line::from(spans)
 }
 
 /// Widest label shown in the overview (`database.hostname`), so values never touch their key.
@@ -284,7 +430,7 @@ fn overview(c: &Connector, app: &App) -> Text<'static> {
     }
     for key in ["topics", "topic.prefix", "database.hostname", "connection.url"] {
         if let Some(v) = c.config.get(key).and_then(|v| v.as_str()) {
-            lines.push(kv(key, Span::raw(v.to_string())));
+            lines.push(kv(key, Span::raw(crate::templates::mask_text(v))));
         }
     }
     let failed = c.tasks.iter().filter(|t| t.state == "FAILED").count();
@@ -312,7 +458,12 @@ fn draw_tasks(f: &mut Frame, app: &App, c: &Connector, area: Rect) {
         .iter()
         .enumerate()
         .map(|(i, t)| {
-            let err = t.trace.as_deref().and_then(|s| s.lines().next()).unwrap_or("");
+            let err = t
+                .trace
+                .as_deref()
+                .and_then(|s| s.lines().next())
+                .map(crate::templates::mask_text)
+                .unwrap_or_default();
             let mut row = Row::new(vec![
                 Cell::from(t.id.to_string()),
                 Cell::from(format!("{} {}", state_symbol(&t.state), t.state))
@@ -337,27 +488,6 @@ fn draw_tasks(f: &mut Frame, app: &App, c: &Connector, area: Rect) {
     )
     .column_spacing(2);
     f.render_widget(table, area);
-}
-
-fn trace_text(c: &Connector) -> Text<'static> {
-    let mut lines: Vec<Line> = Vec::new();
-    let mut section = |title: String, trace: &str| {
-        lines.push(Line::styled(title, Style::new().fg(ERR).add_modifier(Modifier::BOLD)));
-        lines.extend(trace.lines().map(|l| Line::raw(l.replace('\t', "    "))));
-        lines.push(Line::raw(""));
-    };
-    if let Some(t) = &c.trace {
-        section("connector".into(), t);
-    }
-    for t in &c.tasks {
-        if let Some(tr) = &t.trace {
-            section(format!("task {}", t.id), tr);
-        }
-    }
-    if lines.is_empty() {
-        lines.push(Line::styled("No failures reported. 🎉", Style::new().fg(OK)));
-    }
-    Text::from(lines)
 }
 
 fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
@@ -507,7 +637,7 @@ fn draw_overlay(f: &mut Frame, app: &App) {
             f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
         }
         Overlay::Templates(sel) => {
-            let inner = popup(f, 80, 10, "New from template", ACCENT);
+            let inner = popup(f, 80, 12, "New from template", ACCENT);
             let [body, foot] = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(inner);
             let items: Vec<ListItem> = TEMPLATES
                 .iter()
@@ -515,8 +645,16 @@ fn draw_overlay(f: &mut Frame, app: &App) {
                 .map(|(i, t)| {
                     let style =
                         if i == *sel { Style::new().add_modifier(Modifier::REVERSED) } else { Style::new() };
+                    let missing = crate::templates::availability(t, &app.plugins)
+                        == crate::templates::Availability::Missing;
+                    let title = if missing {
+                        format!(" {} — plugin not installed", t.title)
+                    } else {
+                        format!(" {}", t.title)
+                    };
+                    let title_style = if missing { style.fg(DIM) } else { style };
                     ListItem::new(vec![
-                        Line::styled(format!(" {}", t.title), style.add_modifier(Modifier::BOLD)),
+                        Line::styled(title, title_style.add_modifier(Modifier::BOLD)),
                         Line::styled(format!("   {}", t.description), style.fg(DIM)),
                     ])
                 })
@@ -608,7 +746,7 @@ fn draw_preview(f: &mut Frame, app: &App, p: &Preview) {
     let [body, val, foot] =
         Layout::vertical([Constraint::Min(1), Constraint::Length(1 + err_rows), Constraint::Length(2)])
             .areas(inner);
-    f.render_widget(Paragraph::new(preview_json(&p.name, &p.config)).scroll((p.scroll, 0)), body);
+    f.render_widget(Paragraph::new(preview_body(p)).scroll((p.scroll, 0)), body);
     let mut lines = vec![Line::styled(status, Style::new().fg(status_color))];
     lines.extend(details.iter().take(6).map(|e| Line::styled(format!("  {e}"), Style::new().fg(ERR))));
     f.render_widget(Paragraph::new(lines), val);
@@ -624,6 +762,41 @@ fn draw_preview(f: &mut Frame, app: &App, p: &Preview) {
         ]),
         foot,
     );
+}
+
+/// Preview text: for updates the old-vs-new diff and replay heads-ups come first, then the full config.
+fn preview_body(p: &Preview) -> Text<'static> {
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    if let Some(old) = &p.original {
+        let changes = crate::diff::diff(old, &p.config);
+        lines.push(Line::styled(
+            format!("Changes against the running config ({})", changes.len()),
+            Style::new().add_modifier(Modifier::BOLD),
+        ));
+        for (sign, text) in crate::diff::lines(&changes) {
+            let color = match sign {
+                '+' => OK,
+                '-' => ERR,
+                _ => WARN,
+            };
+            lines.push(Line::styled(format!("  {sign} {text}"), Style::new().fg(color)));
+        }
+        let warnings = crate::diff::replay_warnings(&changes, p.is_source);
+        if !warnings.is_empty() {
+            lines.push(Line::raw(""));
+            lines.push(Line::styled(
+                "⚠ Heads-up (a guess from the setting names, not something Tuizium can see):",
+                Style::new().fg(WARN).add_modifier(Modifier::BOLD),
+            ));
+            for (key, note) in warnings {
+                lines.push(Line::styled(format!("  {key}: {note}"), Style::new().fg(WARN)));
+            }
+        }
+        lines.push(Line::raw(""));
+        lines.push(Line::styled("New config", Style::new().add_modifier(Modifier::BOLD)));
+    }
+    lines.extend(preview_json(&p.name, &p.config).lines().map(|l| Line::raw(l.to_string())));
+    Text::from(lines)
 }
 
 fn draw_plugins(f: &mut Frame, app: &App, sel: usize) {
@@ -733,7 +906,10 @@ fn draw_help(f: &mut Frame) {
         ("Tab, 1-4", "Details panel: overview, tasks, config, trace"),
         ("/", "Search by name"),
         ("f / s", "Cycle type / state filter"),
+        ("w / x", "Cycle worker / plugin filter"),
         ("o / O", "Cycle sort column / reverse"),
+        ("/ n N", "In the Trace panel: search, next / previous match"),
+        ("y", "Copy config / trace (secrets masked) in details; error text in an error box"),
         ("r / a", "Refresh now / toggle auto refresh"),
         ("Space", "Mark connector (batch p/u/R/d/F act on marks)"),
         ("p / u", "Pause / resume connector(s)"),
@@ -827,6 +1003,190 @@ mod tests {
         term.draw(|f| draw(f, &mut app)).unwrap();
         let s = screen(&term);
         assert!(s.contains("Tuizium") && s.contains("orders-cdc") && s.contains("PostgresConnect"));
+    }
+
+    #[tokio::test]
+    async fn config_and_overview_panels_never_show_secrets() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut cfg = Config::with_local_default();
+        cfg.clusters.get_mut("local").unwrap().url = "http://127.0.0.1:1".into();
+        let mut app = App::new(cfg, None, "local".into(), tx);
+        let mut c = Connector {
+            name: "pg".into(),
+            kind: Kind::Source,
+            state: "RUNNING".into(),
+            worker_id: "w".into(),
+            class: "io.debezium.connector.postgresql.PostgresConnector".into(),
+            config: serde_json::Map::new(),
+            tasks: vec![Task {
+                id: 0,
+                state: "FAILED".into(),
+                worker_id: "w".into(),
+                trace: Some(
+                    "connect failed: jdbc:postgresql://h/db?user=u&password=TopSecret-4&ssl=1".into(),
+                ),
+            }],
+            trace: Some("jdbc:postgresql://h/db?password=TopSecret-3 refused".into()),
+        };
+        for (k, v) in [
+            ("database.password", "TopSecret-1"),
+            ("database.user", "app_user"),
+            ("connection.url", "jdbc:postgresql://h/db?password=TopSecret-2"),
+        ] {
+            c.config.insert(k.into(), v.into());
+        }
+        app.update(Msg::Loaded {
+            generation: 1,
+            result: Ok(Snapshot { root: None, connectors: vec![c], plugins: None }),
+        });
+        for panel in ['1', '2', '3', '4'] {
+            app.update(Msg::Key(KeyEvent::from(KeyCode::Char(panel))));
+            let mut term = Terminal::new(TestBackend::new(120, 40)).unwrap();
+            term.draw(|f| draw(f, &mut app)).unwrap();
+            let s = screen(&term);
+            assert!(
+                !s.contains("TopSecret"),
+                "panel {panel} leaked a secret: {}",
+                s.split("TopSecret").nth(1).unwrap_or("")
+            );
+            if panel == '3' {
+                assert!(s.contains("********") && s.contains("app_user"));
+            }
+            if panel == '4' {
+                assert!(
+                    s.contains("password=********") && s.contains("&ssl=1"),
+                    "trace is masked, not dropped"
+                );
+            }
+        }
+        // Only the display is masked: the stored config (used for editing and saving) is untouched.
+        assert_eq!(app.connectors[0].config["database.password"], "TopSecret-1");
+    }
+
+    fn connector(name: &str, state: &str, task: &str, trace: Option<&str>) -> Connector {
+        Connector {
+            name: name.into(),
+            kind: Kind::Sink,
+            state: state.into(),
+            worker_id: "w:8083".into(),
+            class: "io.confluent.connect.jdbc.JdbcSinkConnector".into(),
+            config: serde_json::Map::new(),
+            tasks: vec![Task {
+                id: 0,
+                state: task.into(),
+                worker_id: "w".into(),
+                trace: trace.map(String::from),
+            }],
+            trace: None,
+        }
+    }
+
+    fn app_with(connectors: Vec<Connector>) -> App {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut cfg = Config::with_local_default();
+        cfg.clusters.get_mut("local").unwrap().url = "http://127.0.0.1:1".into();
+        let mut app = App::new(cfg, None, "local".into(), tx);
+        app.update(Msg::Loaded {
+            generation: 1,
+            result: Ok(Snapshot { root: None, connectors, plugins: None }),
+        });
+        app
+    }
+
+    fn key(app: &mut App, code: KeyCode) {
+        app.update(Msg::Key(KeyEvent::from(code)));
+    }
+
+    #[tokio::test]
+    async fn narrow_lists_keep_names_and_wide_headers_show_totals() {
+        let mut app = app_with(vec![
+            connector("orders-sink", "RUNNING", "RUNNING", None),
+            connector("audit-sink", "PAUSED", "PAUSED", None),
+            connector("broken-sink", "RUNNING", "FAILED", Some("boom")),
+        ]);
+        for width in [80u16, 60, 50, 40, 30, 24] {
+            let mut term = Terminal::new(TestBackend::new(width, 20)).unwrap();
+            term.draw(|f| draw(f, &mut app)).unwrap();
+            let s = screen(&term);
+            assert!(s.contains("NAME"), "{width} columns: NAME header missing");
+            assert!(s.contains("orders"), "{width} columns: connector names must stay visible");
+            assert!(s.contains("STATE") || width < 34, "{width} columns: STATE missing");
+            assert!(
+                s.contains('●') || s.contains('‖') || s.contains('✖'),
+                "{width} columns: no state at all"
+            );
+        }
+        let mut term = Terminal::new(TestBackend::new(130, 20)).unwrap();
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        let s = screen(&term);
+        assert!(s.contains("1 ok") && s.contains("1 paused") && s.contains("1 failed"), "header totals");
+        // Too narrow for the totals: they are simply not drawn.
+        let mut term = Terminal::new(TestBackend::new(90, 20)).unwrap();
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        assert!(!screen(&term).contains("1 ok"));
+    }
+
+    #[tokio::test]
+    async fn update_preview_shows_a_masked_diff_and_heads_up() {
+        let mut c = connector("jdbc-out", "RUNNING", "RUNNING", None);
+        c.config.insert("topics".into(), "orders".into());
+        c.config.insert("connection.password".into(), "OldSecret-1".into());
+        let mut app = app_with(vec![c]);
+        let path = std::env::temp_dir().join(format!("tuizium-ui-test-{}.json", std::process::id()));
+        std::fs::write(
+            &path,
+            r#"{"name":"jdbc-out","topics":"orders,refunds","connection.password":"NewSecret-2"}"#,
+        )
+        .unwrap();
+        // The editor flow is driven through the real key: `e` queues the request, then we answer it.
+        key(&mut app, KeyCode::Char('e'));
+        let mut req = app.editor_request.take().expect("editor requested");
+        let _ = std::fs::remove_file(&req.path);
+        req.path = path.clone();
+        app.editor_finished(req, Ok(()));
+        let mut term = Terminal::new(TestBackend::new(140, 50)).unwrap();
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        let s = screen(&term);
+        assert!(s.contains("Changes against the running config"), "{s}");
+        assert!(s.contains("orders,refunds"), "{s}");
+        assert!(s.contains("Heads-up") && s.contains("topics changed"), "{s}");
+        assert!(!s.contains("OldSecret") && !s.contains("NewSecret"), "secrets leaked into the diff");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn trace_panel_highlights_search_matches_and_shows_the_search_bar() {
+        let mut app = app_with(vec![connector(
+            "bad",
+            "RUNNING",
+            "FAILED",
+            Some(
+                "java.lang.IllegalStateException: boom\n\tat org.Foo.run(Foo.java:1)\n\tat org.Bar.run(Bar.java:2)",
+            ),
+        )]);
+        key(&mut app, KeyCode::Enter);
+        key(&mut app, KeyCode::Char('4'));
+        key(&mut app, KeyCode::Char('/'));
+        for ch in "bar".chars() {
+            key(&mut app, KeyCode::Char(ch));
+        }
+        let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        let s = screen(&term);
+        assert!(s.contains("/bar") && s.contains("1 match row(s)"), "{s}");
+        // The matching text is drawn with the highlight background.
+        let highlighted: String = term
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .filter(|c| c.style().bg == Some(WARN))
+            .map(|c| c.symbol())
+            .collect();
+        assert_eq!(highlighted.to_lowercase(), "barbar", "both occurrences on the row");
+        key(&mut app, KeyCode::Esc);
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        assert!(!screen(&term).contains("match row(s)"));
     }
 
     #[tokio::test]

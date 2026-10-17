@@ -303,7 +303,7 @@ fn describe_http(status: StatusCode, body: &str) -> String {
         .ok()
         .and_then(|v| v.get("message").and_then(Value::as_str).map(str::to_string))
         .unwrap_or_else(|| body.trim().to_string());
-    let msg = clip(&msg, MAX_ERROR_CHARS);
+    let msg = clip(&crate::templates::mask_text(&msg), MAX_ERROR_CHARS);
     let hint = match status {
         StatusCode::UNAUTHORIZED => " — check credentials (password_env / token_env)",
         StatusCode::FORBIDDEN => " — the account is not allowed to do this",
@@ -813,5 +813,15 @@ mod tests {
             let _ = parse_validation(body);
         }
         assert_eq!(parse_validation(r#"{"configs":[{"value":{"errors":[1,null,"x"]}}]}"#).unwrap(), ["?: x"]);
+    }
+
+    #[test]
+    fn error_bodies_do_not_echo_password_parameters() {
+        let body = r#"{"error_code":500,"message":"bad url jdbc:postgresql://h/db?user=u&password=Hunter2&ssl=true"}"#;
+        let msg = describe_http(StatusCode::INTERNAL_SERVER_ERROR, body);
+        assert!(
+            !msg.contains("Hunter2") && msg.contains("password=********") && msg.contains("ssl=true"),
+            "{msg}"
+        );
     }
 }

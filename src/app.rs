@@ -2,6 +2,7 @@
 //! network I/O is spawned onto the Tokio runtime and reported back as `Msg`s,
 //! so the UI thread never blocks on the API.
 
+use std::cell::Cell;
 use std::collections::BTreeSet;
 use std::future::Future;
 use std::path::PathBuf;
@@ -309,6 +310,10 @@ pub struct Preview {
     /// `true` = update an existing connector (PUT), `false` = create (POST).
     pub update: bool,
     pub validation: Validation,
+    /// The config as it is on the cluster now; set for updates so the preview can show a diff.
+    pub original: Option<Map<String, Value>>,
+    /// Whether the connector is a source; picks which replay heads-ups apply.
+    pub is_source: bool,
 }
 
 pub struct AddCluster {
@@ -355,8 +360,18 @@ pub struct App {
     pub searching: bool,
     pub type_filter: TypeFilter,
     pub state_filter: StateFilter,
+    /// Only connectors whose worker (`host:port`) equals this; cycled with `w`.
+    pub worker_filter: Option<String>,
+    /// Only connectors using this plugin class; cycled with `x`.
+    pub plugin_filter: Option<String>,
     pub sort: SortKey,
     pub sort_desc: bool,
+
+    /// Search inside the Trace panel (`/` while it is focused); empty = no search.
+    pub trace_query: String,
+    pub trace_searching: bool,
+    /// Width of the Trace panel at the last draw, so match jumps can count wrapped rows.
+    pub trace_width: Cell<u16>,
 
     pub focus: Focus,
     pub panel: Panel,
@@ -434,8 +449,13 @@ impl App {
             searching: false,
             type_filter: TypeFilter::All,
             state_filter: StateFilter::All,
+            worker_filter: None,
+            plugin_filter: None,
             sort: SortKey::Name,
             sort_desc: false,
+            trace_query: String::new(),
+            trace_searching: false,
+            trace_width: Cell::new(80),
             focus: Focus::List,
             panel: Panel::Overview,
             task_sel: 0,
@@ -560,6 +580,10 @@ impl App {
         self.visible.clear();
         self.marked.clear();
         self.plugins.clear();
+        self.worker_filter = None;
+        self.plugin_filter = None;
+        self.trace_query.clear();
+        self.trace_searching = false;
         self.table.select(None);
         self.last_refresh = None;
         self.loading = false;
@@ -790,6 +814,8 @@ impl App {
                         TypeFilter::Sink => c.kind == Kind::Sink,
                     }
                     && self.state_filter.matches(c)
+                    && self.worker_filter.as_ref().is_none_or(|w| &c.worker_id == w)
+                    && self.plugin_filter.as_ref().is_none_or(|p| &c.class == p)
             })
             .map(|(i, _)| i)
             .collect();
@@ -876,7 +902,117 @@ impl App {
             self.on_search_key(key);
             return;
         }
+        if self.trace_searching {
+            self.on_trace_search_key(key);
+            return;
+        }
         self.on_main_key(key);
+    }
+
+    /// `true` while the Trace panel has the keyboard (so `/`, `n`, `N` and `y` act on the trace).
+    fn in_trace(&self) -> bool {
+        self.focus == Focus::Details && self.panel == Panel::Trace
+    }
+
+    fn on_trace_search_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc => {
+                self.trace_query.clear();
+                self.trace_searching = false;
+            }
+            KeyCode::Enter => self.trace_searching = false,
+            KeyCode::Backspace => {
+                self.trace_query.pop();
+            }
+            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => self.trace_query.push(c),
+            _ => return,
+        }
+        self.jump_to_match(0, true);
+    }
+
+    /// Scrolls the Trace panel to the next (`dir > 0`) or previous (`dir < 0`) match; `dir == 0`
+    /// keeps the current row if it already matches. Wraps around.
+    fn jump_to_match(&mut self, dir: isize, include_current: bool) {
+        let Some(c) = self.selected() else { return };
+        let rows = trace_rows(c, self.trace_width.get() as usize);
+        let hits: Vec<usize> = trace_matches(&rows, &self.trace_query);
+        if hits.is_empty() {
+            if !self.trace_query.is_empty() && !self.trace_searching {
+                self.toast(format!("no match for \"{}\"", self.trace_query), Level::Info);
+            }
+            return;
+        }
+        let cur = self.scroll as usize;
+        let target = if dir >= 0 {
+            let from = if include_current { cur } else { cur + 1 };
+            hits.iter().copied().find(|&h| h >= from).unwrap_or(hits[0])
+        } else {
+            hits.iter().rev().copied().find(|&h| h < cur).unwrap_or(hits[hits.len() - 1])
+        };
+        self.scroll = target.min(10_000) as u16;
+    }
+
+    /// Copies sanitised text (secrets masked, control characters removed) to the terminal clipboard.
+    fn copy(&mut self, what: &str, text: String) {
+        match crate::clip::copy(&crate::clip::sanitize(&text)) {
+            Ok(()) => self.toast(
+                format!("{what} sent to the clipboard (OSC 52; nothing happens if your terminal blocks it)"),
+                Level::Info,
+            ),
+            Err(e) => self.toast(format!("cannot copy: {e}"), Level::Error),
+        }
+    }
+
+    /// Text for `y` in the details view: the masked config on the Config panel, the masked traces
+    /// on the Trace panel.
+    fn copy_selection(&mut self) {
+        let Some(c) = self.selected() else { return };
+        let (what, text) = match self.panel {
+            Panel::Config => (
+                "config (secrets masked)",
+                serde_json::to_string_pretty(&templates::masked(&c.config)).unwrap_or_default(),
+            ),
+            Panel::Trace => {
+                let rows = trace_rows(c, usize::MAX);
+                if rows.iter().all(|r| r.kind == RowKind::Empty) {
+                    return self.toast("nothing to copy: no failures reported".into(), Level::Info);
+                }
+                ("trace (secrets masked)", rows.into_iter().map(|r| r.text).collect::<Vec<_>>().join("\n"))
+            }
+            _ => return self.toast("open the Config (3) or Trace (4) panel to copy".into(), Level::Info),
+        };
+        self.copy(what, text);
+    }
+
+    /// Distinct values of `key` over the current connectors, sorted.
+    fn distinct(&self, key: impl Fn(&Connector) -> &str) -> Vec<String> {
+        let set: BTreeSet<&str> = self.connectors.iter().map(&key).filter(|v| !v.is_empty()).collect();
+        set.into_iter().map(str::to_string).collect()
+    }
+
+    /// Next value after `cur` in `values`, or `None` (= no filter) after the last one.
+    fn cycle(cur: &Option<String>, values: &[String]) -> Option<String> {
+        match cur.as_ref().and_then(|c| values.iter().position(|v| v == c)) {
+            Some(i) => values.get(i + 1).cloned(),
+            None => values.first().cloned(),
+        }
+    }
+
+    /// Counts for the header: healthy, paused, failed, other.
+    pub fn health(&self) -> Health {
+        let mut h = Health::default();
+        for c in &self.connectors {
+            if c.is_failed() {
+                h.failed += 1;
+            } else if c.is_paused() {
+                h.paused += 1;
+            } else if c.state == "RUNNING" && c.tasks.iter().all(|t| t.state == "RUNNING") {
+                h.healthy += 1;
+            } else {
+                h.other += 1;
+            }
+        }
+        h
     }
 
     fn on_search_key(&mut self, key: KeyEvent) {
@@ -901,17 +1037,23 @@ impl App {
             KeyCode::Char('q') => self.should_quit = true,
             KeyCode::Char('?') | KeyCode::F(1) => self.overlay = Overlay::Help,
             KeyCode::Esc => {
-                if details {
+                if details && !self.trace_query.is_empty() {
+                    self.trace_query.clear();
+                } else if details {
                     self.focus = Focus::List;
                 } else if !self.marked.is_empty() {
                     self.marked.clear();
                 } else if !self.query.is_empty()
                     || self.type_filter != TypeFilter::All
                     || self.state_filter != StateFilter::All
+                    || self.worker_filter.is_some()
+                    || self.plugin_filter.is_some()
                 {
                     self.query.clear();
                     self.type_filter = TypeFilter::All;
                     self.state_filter = StateFilter::All;
+                    self.worker_filter = None;
+                    self.plugin_filter = None;
                     self.rebuild_view(None);
                 }
             }
@@ -929,9 +1071,30 @@ impl App {
             KeyCode::Tab | KeyCode::Char(']') => self.cycle_panel(1),
             KeyCode::BackTab | KeyCode::Char('[') => self.cycle_panel(-1),
             KeyCode::Char(c @ '1'..='4') => self.set_panel(Panel::ALL[c as usize - '1' as usize]),
+            KeyCode::Char('/') if self.in_trace() => {
+                self.trace_searching = true;
+                self.jump_to_match(0, true);
+            }
             KeyCode::Char('/') => {
                 self.focus = Focus::List;
                 self.searching = true;
+            }
+            KeyCode::Char('n') if self.in_trace() && !self.trace_query.is_empty() => {
+                self.jump_to_match(1, false)
+            }
+            KeyCode::Char('N') if self.in_trace() && !self.trace_query.is_empty() => {
+                self.jump_to_match(-1, false)
+            }
+            KeyCode::Char('y') if details => self.copy_selection(),
+            KeyCode::Char('w') => {
+                let workers = self.distinct(|c| c.worker_id.as_str());
+                self.worker_filter = Self::cycle(&self.worker_filter, &workers);
+                self.rebuild_view(None);
+            }
+            KeyCode::Char('x') => {
+                let classes = self.distinct(|c| c.class.as_str());
+                self.plugin_filter = Self::cycle(&self.plugin_filter, &classes);
+                self.rebuild_view(None);
             }
             KeyCode::Char('r') => {
                 self.loading = false;
@@ -1094,9 +1257,9 @@ impl App {
                 req.name
             ));
         }
-        if config.values().any(|v| v.as_str() == Some("[hidden]")) {
+        if config.values().any(|v| matches!(v.as_str(), Some("[hidden]" | "********"))) {
             return self.error_overlay(
-                "The config contains \"[hidden]\" values: Kafka Connect masks secrets when reading, and saving would \
+                "The config contains masked values (\"[hidden]\" or \"********\"): saving would \
                  overwrite the real secret with that literal text.\n\nReplace them with the real value or a config-provider \
                  reference such as ${file:/path:key} / ${env:VAR}, then edit again."
                     .into(),
@@ -1108,7 +1271,13 @@ impl App {
         if config == original {
             return self.toast("no changes".into(), Level::Info);
         }
-        self.overlay = self.open_preview(name, config, PreviewSource::Edit, true);
+        let is_source = self.connectors.iter().any(|c| c.name == name && c.kind == Kind::Source);
+        let mut overlay = self.open_preview(name, config, PreviewSource::Edit, true);
+        if let Overlay::Preview(p) = &mut overlay {
+            p.original = Some(original);
+            p.is_source = is_source;
+        }
+        self.overlay = overlay;
     }
 
     fn open_preview(
@@ -1131,7 +1300,17 @@ impl App {
             }
             None => Validation::Unavailable("not connected".into()),
         };
-        Overlay::Preview(Box::new(Preview { id, name, config, scroll: 0, source, update, validation }))
+        Overlay::Preview(Box::new(Preview {
+            id,
+            name,
+            config,
+            scroll: 0,
+            source,
+            update,
+            validation,
+            original: None,
+            is_source: false,
+        }))
     }
 
     fn nav(&mut self, delta: isize) {
@@ -1175,6 +1354,10 @@ impl App {
             },
             Overlay::Error(e) => match code {
                 KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') => Overlay::None,
+                KeyCode::Char('y') => {
+                    self.copy("error text", e.clone());
+                    Overlay::Error(e)
+                }
                 _ => Overlay::Error(e),
             },
             Overlay::Confirm(c) => match code {
@@ -1209,7 +1392,22 @@ impl App {
                 KeyCode::Esc | KeyCode::Char('q') => Overlay::None,
                 KeyCode::Down | KeyCode::Char('j') => Overlay::Templates((sel + 1).min(TEMPLATES.len() - 1)),
                 KeyCode::Up | KeyCode::Char('k') => Overlay::Templates(sel.saturating_sub(1)),
-                KeyCode::Enter => Overlay::Form(Box::new(FormState::new(sel))),
+                KeyCode::Enter => {
+                    let t = &TEMPLATES[sel];
+                    if templates::availability(t, &self.plugins) == templates::Availability::Missing {
+                        self.toast(
+                            format!(
+                                "\"{}\" needs {}, which is not installed on this cluster — press P to list installed plugins",
+                                t.title,
+                                t.class()
+                            ),
+                            Level::Error,
+                        );
+                        Overlay::Templates(sel)
+                    } else {
+                        Overlay::Form(Box::new(FormState::new(sel)))
+                    }
+                }
                 _ => Overlay::Templates(sel),
             },
             Overlay::Form(mut f) => {
@@ -1288,7 +1486,8 @@ impl App {
                         let n = name.clone();
                         // A paused connector legitimately stays paused after a config update.
                         let paused = self.connectors.iter().any(|c| c.name == name && c.is_paused());
-                        let watch = if paused { vec![] } else { vec![(name.clone(), Expect::Running)] };
+                        let expect = if update { Expect::Running } else { Expect::Created };
+                        let watch = if paused { vec![] } else { vec![(name.clone(), expect)] };
                         if update {
                             config.insert("name".into(), Value::String(n.clone()));
                             self.run_action(
@@ -1389,6 +1588,80 @@ impl App {
         }
         Ok(())
     }
+}
+
+/// Connector counts shown in the header.
+#[derive(Default, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Health {
+    pub healthy: usize,
+    pub paused: usize,
+    pub failed: usize,
+    pub other: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RowKind {
+    Heading,
+    Line,
+    /// "No failures reported" placeholder; never copied.
+    Empty,
+}
+
+/// One screen row of the Trace panel (already masked, sanitised and wrapped).
+#[derive(Clone, Debug)]
+pub struct TraceRow {
+    pub text: String,
+    pub kind: RowKind,
+}
+
+/// The Trace panel as rows of at most `width` characters. Wrapping is done here (not by the
+/// widget) so that a row index is exactly a scroll offset, which search relies on.
+pub fn trace_rows(c: &Connector, width: usize) -> Vec<TraceRow> {
+    let width = width.max(1);
+    let mut rows = Vec::new();
+    let mut section = |title: String, trace: &str| {
+        rows.push(TraceRow { text: title, kind: RowKind::Heading });
+        for line in templates::mask_text(trace).lines() {
+            let line: String = line
+                .chars()
+                .map(|ch| if ch == '\t' { ' ' } else { ch })
+                .filter(|ch| !ch.is_control())
+                .collect();
+            let chars: Vec<char> = line.chars().collect();
+            if chars.is_empty() {
+                rows.push(TraceRow { text: String::new(), kind: RowKind::Line });
+            }
+            for chunk in chars.chunks(width) {
+                rows.push(TraceRow { text: chunk.iter().collect(), kind: RowKind::Line });
+            }
+        }
+        rows.push(TraceRow { text: String::new(), kind: RowKind::Line });
+    };
+    if let Some(t) = &c.trace {
+        section("connector".into(), t);
+    }
+    for t in &c.tasks {
+        if let Some(tr) = &t.trace {
+            section(format!("task {}", t.id), tr);
+        }
+    }
+    if rows.is_empty() {
+        rows.push(TraceRow { text: "No failures reported.".into(), kind: RowKind::Empty });
+    }
+    rows
+}
+
+/// Indices of rows containing `query` (case-insensitive); none for an empty query.
+pub fn trace_matches(rows: &[TraceRow], query: &str) -> Vec<usize> {
+    if query.is_empty() {
+        return Vec::new();
+    }
+    let q = query.to_lowercase();
+    rows.iter()
+        .enumerate()
+        .filter(|(_, r)| r.kind != RowKind::Empty && r.text.to_lowercase().contains(&q))
+        .map(|(i, _)| i)
+        .collect()
 }
 
 /// Reads a connector definition from a file path, or inline JSON if the input
@@ -1604,6 +1877,7 @@ mod tests {
             (r#"{"name":"alpha","a":"1"}"#, "none"), // unchanged
             (r#"{"name":"renamed","a":"2"}"#, "error"),
             (r#"{"name":"alpha","password":"[hidden]"}"#, "error"),
+            (r#"{"name":"alpha","password":"********"}"#, "error"), // our own display mask must never be saved
             ("{oops", "error"),
         ];
         for (text, want) in cases {
@@ -1624,6 +1898,137 @@ mod tests {
             };
             assert_eq!(got, want, "input {text}");
         }
+    }
+
+    fn press(app: &mut App, c: char) {
+        app.on_key(KeyEvent::from(KeyCode::Char(c)));
+    }
+
+    #[tokio::test]
+    async fn worker_and_plugin_filters_cycle_and_esc_clears_them() {
+        let (mut app, _rx) = app();
+        app.connectors[1].worker_id = "w2:8083".into();
+        app.rebuild_view(None);
+        press(&mut app, 'w');
+        assert_eq!(app.worker_filter.as_deref(), Some("w2:8083"));
+        assert_eq!(names(&app), ["beta"]);
+        press(&mut app, 'w');
+        assert_eq!(app.worker_filter.as_deref(), Some("w:8083"));
+        assert_eq!(names(&app), ["alpha", "gamma"]);
+        press(&mut app, 'w');
+        assert_eq!(app.worker_filter, None);
+        assert_eq!(names(&app), ["alpha", "beta", "gamma"]);
+
+        press(&mut app, 'x');
+        assert_eq!(app.plugin_filter.as_deref(), Some("x.alphaConnector"));
+        assert_eq!(names(&app), ["alpha"]);
+        press(&mut app, 'w'); // first worker is w2 (beta's), and alpha is not on it
+        assert!(names(&app).is_empty(), "filters combine with AND");
+        app.on_key(KeyEvent::from(KeyCode::Esc));
+        assert!(app.plugin_filter.is_none() && app.worker_filter.is_none());
+        assert_eq!(names(&app), ["alpha", "beta", "gamma"]);
+    }
+
+    #[tokio::test]
+    async fn header_counts_come_from_the_snapshot() {
+        let (app, _rx) = app();
+        assert_eq!(app.health(), Health { healthy: 1, paused: 1, failed: 1, other: 0 });
+    }
+
+    #[tokio::test]
+    async fn trace_search_jumps_between_matches_and_n_stays_new_connector_otherwise() {
+        let (mut app, _rx) = app();
+        app.connectors[1].tasks[1].trace = Some("Boom: one\n at A\n at B\nCaused by: two\n at A".into());
+        app.rebuild_view(Some("beta".into()));
+        app.focus = Focus::Details;
+        app.panel = Panel::Trace;
+
+        press(&mut app, '/');
+        assert!(app.trace_searching);
+        for ch in "at a".chars() {
+            press(&mut app, ch);
+        }
+        app.on_key(KeyEvent::from(KeyCode::Enter));
+        assert!(!app.trace_searching && app.trace_query == "at a");
+        assert_eq!(app.scroll, 2, "first match: row 0 is the heading, row 1 'Boom'");
+        press(&mut app, 'n');
+        assert_eq!(app.scroll, 5);
+        press(&mut app, 'n');
+        assert_eq!(app.scroll, 2, "wraps around");
+        press(&mut app, 'N');
+        assert_eq!(app.scroll, 5, "wraps backwards");
+
+        app.on_key(KeyEvent::from(KeyCode::Esc));
+        assert!(
+            app.trace_query.is_empty() && app.focus == Focus::Details,
+            "first Esc only clears the search"
+        );
+        press(&mut app, 'n');
+        assert!(matches!(app.overlay, Overlay::Import(_)), "with no search, n is still 'new connector'");
+    }
+
+    #[test]
+    fn trace_rows_wrap_mask_and_strip_control_characters() {
+        let mut c = conn("c", Kind::Sink, "FAILED", &[]);
+        c.trace = Some("password=hunter2\u{1b}[31m x\n\tabcdefghij".into());
+        let rows = trace_rows(&c, 4);
+        let all: String = rows.iter().map(|r| r.text.as_str()).collect();
+        assert!(!all.contains("hunter2") && !all.contains('\u{1b}'), "{all}");
+        assert!(rows.iter().filter(|r| r.kind == RowKind::Line).all(|r| r.text.chars().count() <= 4));
+        assert_eq!(rows[0].kind, RowKind::Heading);
+        let healthy = trace_rows(&conn("ok", Kind::Sink, "RUNNING", &["RUNNING"]), 40);
+        assert_eq!(healthy.len(), 1);
+        assert_eq!(healthy[0].kind, RowKind::Empty);
+        assert!(trace_matches(&healthy, "failures").is_empty(), "the placeholder is not a match");
+    }
+
+    #[tokio::test]
+    async fn update_preview_carries_the_running_config_for_the_diff() {
+        let (mut app, _rx) = app();
+        app.connectors[1].config.insert("topics".into(), Value::String("t1".into()));
+        app.rebuild_view(Some("beta".into()));
+        let mut req = edit_req(&app, &[("topics", "t1")]);
+        req.name = "beta".into();
+        std::fs::write(&req.path, r#"{"name":"beta","topics":"t1,t2"}"#).unwrap();
+        app.editor_finished(req, Ok(()));
+        let Overlay::Preview(p) = &app.overlay else { panic!("expected a preview") };
+        assert_eq!(p.original.as_ref().and_then(|o| o.get("topics")).and_then(Value::as_str), Some("t1"));
+        assert!(!p.is_source, "beta is a sink");
+        let changes = crate::diff::diff(p.original.as_ref().unwrap(), &p.config);
+        assert_eq!(crate::diff::replay_warnings(&changes, p.is_source).len(), 1);
+    }
+
+    #[tokio::test]
+    async fn editor_file_holds_the_real_secret_not_the_display_mask() {
+        let (mut app, _rx) = app();
+        app.connectors[0].config.insert("database.password".into(), Value::String("real-pw".into()));
+        app.table.select(Some(0));
+        app.request_edit();
+        let req = app.editor_request.take().expect("editor requested");
+        let text = std::fs::read_to_string(&req.path).unwrap();
+        let _ = std::fs::remove_file(&req.path);
+        assert!(text.contains("real-pw") && !text.contains("********"), "{text}");
+        assert_eq!(req.original["database.password"], "real-pw");
+    }
+
+    #[tokio::test]
+    async fn template_whose_plugin_is_not_installed_is_refused_with_a_clear_message() {
+        let (mut app, _rx) = app();
+        let pick = |title: &str| TEMPLATES.iter().position(|t| t.title == title).unwrap();
+        app.plugins = vec![crate::api::Plugin {
+            class: "io.debezium.connector.postgresql.PostgresConnector".into(),
+            kind: "source".into(),
+            version: "3".into(),
+        }];
+        app.overlay = Overlay::Templates(pick("Confluent JDBC Sink"));
+        app.on_key(KeyEvent::from(KeyCode::Enter));
+        assert!(matches!(app.overlay, Overlay::Templates(_)), "must not open the form");
+        let t = app.toast.as_ref().expect("explanation");
+        assert!(t.level == Level::Error && t.text.contains("io.confluent.connect.jdbc.JdbcSinkConnector"));
+        assert!(t.text.contains("not installed"), "{}", t.text);
+        app.overlay = Overlay::Templates(pick("Debezium PostgreSQL Source"));
+        app.on_key(KeyEvent::from(KeyCode::Enter));
+        assert!(matches!(app.overlay, Overlay::Form(_)));
     }
 
     #[tokio::test]
@@ -1672,6 +2077,8 @@ mod tests {
         restarting_polls: u32,
         /// Task 0 of "c1" stays FAILED forever.
         stuck_failed: bool,
+        /// List calls answered since "new1" was created; it only shows up from the 3rd call on.
+        create_polls: Option<u32>,
     }
 
     fn json_conn(name: &str, state: &str, task: &str) -> String {
@@ -1714,11 +2121,21 @@ mod tests {
                                     f.restart_polls = Some(p + 1);
                                 }
                                 let mut all = Vec::new();
+                                if let Some(p) = f.create_polls {
+                                    if p >= 2 {
+                                        all.push(json_conn("new1", "RUNNING", "RUNNING"));
+                                    }
+                                    f.create_polls = Some(p + 1);
+                                }
                                 if !f.deleted {
                                     all.push(json_conn("c1", c1.0, c1.1));
                                 }
                                 all.push(json_conn("c2", "RUNNING", "RUNNING"));
                                 (200, format!("{{{}}}", all.join(",")))
+                            }
+                            ("POST", "/connectors") => {
+                                f.create_polls = Some(0);
+                                (201, r#"{"name":"new1"}"#.to_string())
                             }
                             ("PUT", "/connectors/c1/pause") => {
                                 f.paused = true;
@@ -1777,6 +2194,46 @@ mod tests {
             app.update(Msg::Tick);
         }
         panic!("condition not reached; journal: {:#?}", app.log.entries);
+    }
+
+    #[tokio::test]
+    async fn created_connector_that_appears_late_is_confirmed_without_false_warnings() {
+        let (url, _fake) = fake_connect().await;
+        let (mut app, mut rx) = live_app(&url).await;
+        let mut cfg = Map::new();
+        cfg.insert("connector.class".into(), Value::String("x.NewConnector".into()));
+        app.overlay = app.open_preview("new1".into(), cfg, PreviewSource::Edit, false);
+        let Overlay::Preview(p) = &app.overlay else { panic!("no preview") };
+        let id = p.id;
+        app.update(Msg::Validated { id, result: Ok(vec![]) });
+        app.on_key(KeyEvent::from(KeyCode::Enter));
+        pump(&mut app, &mut rx, |a| !a.watches.is_empty()).await;
+        pump(&mut app, &mut rx, |a| a.watches.is_empty()).await;
+        let j = journal(&app);
+        assert!(!j.contains("not listed"), "{j}");
+        let last = app.log.last().unwrap();
+        assert_eq!(last.severity, Severity::Ok, "{j}");
+        assert!(last.text.contains("new1") && last.text.contains("created"), "{}", last.text);
+    }
+
+    #[tokio::test]
+    async fn created_connector_that_never_appears_is_reported_after_the_timeout() {
+        let (url, _fake) = fake_connect().await;
+        let (mut app, mut rx) = live_app(&url).await;
+        app.run_action(
+            "create ghost".into(),
+            Some("ghost".into()),
+            vec![("ghost".into(), Expect::Created)],
+            |_| async { Ok(()) },
+        );
+        pump(&mut app, &mut rx, |a| !a.watches.is_empty()).await;
+        for w in &mut app.watches {
+            w.started -= activity::WATCH_TIMEOUT;
+        }
+        pump(&mut app, &mut rx, |a| a.watches.is_empty()).await;
+        let last = app.log.last().unwrap();
+        assert_eq!(last.severity, Severity::Warn);
+        assert!(last.text.contains("ghost") && last.text.contains("not listed"), "{}", last.text);
     }
 
     fn journal(app: &App) -> String {
