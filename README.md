@@ -19,7 +19,7 @@ other Kafka Connect connector. Every action uses the official
   manual + automatic refresh, failed connectors highlighted
 - Details: overview, task states, config JSON, failure traces
 - Actions: pause, resume, restart (connector or single task), delete (confirmed), create from JSON file / inline JSON
-- Templates (Debezium PostgreSQL, Debezium MySQL, JDBC Sink) with editable fields, masked JSON preview and confirmation
+- Templates (Debezium PostgreSQL, Debezium MySQL, Debezium JDBC Sink, Confluent JDBC Sink) with editable fields, masked JSON preview and confirmation; a template whose plugin the cluster does not have is marked and cannot be opened
 - Never blocks the UI on network calls; handles timeouts and unreachable clusters; restores the terminal on exit/panic
 
 ## What does Tuizium talk to?
@@ -86,6 +86,33 @@ tuizium --url http://host:8083
 tuizium --no-splash           # skip the opening screen (or set TUIZIUM_NO_SPLASH)
 ```
 
+Tuizium needs an interactive terminal for the UI: if stdin or stdout is a pipe or a file it prints an error and exits with code 1 (`--help`, `--version` and the commands below work anywhere).
+
+### Commands for scripts and CI
+
+A subcommand runs once and exits. No terminal is needed, output is plain text or JSON (never colours), and secrets are masked.
+They need the same `--url` / `--cluster` / `--config` selection as the UI (without them the `default_cluster`, or else the first profile, is used).
+
+```sh
+tuizium --url http://localhost:8083 list                      # table; add --state failed, --type sink, -o json
+tuizium --url http://localhost:8083 status my-connector -o json
+tuizium --url http://localhost:8083 pause my-connector --wait     # --wait polls up to 15 s and says whether it really paused
+tuizium --url http://localhost:8083 resume a b c
+tuizium --url http://localhost:8083 restart my-connector --only-failed --wait
+tuizium --url http://localhost:8083 update my-connector.json --dry-run   # validate + show the diff, send nothing
+tuizium --url http://localhost:8083 create my-connector.json      # or "-" to read the JSON from stdin
+```
+
+| Exit code | Meaning |
+|---|---|
+| 0 | success (and, with `--wait`, confirmed) |
+| 1 | error: cannot connect, HTTP error, bad input, validation failed |
+| 2 | usage error |
+| 3 | the request was accepted but the connector is unhealthy (`status`) or the change was not confirmed (`--wait`) |
+
+Without `--wait` a mutating command only reports that Kafka Connect accepted the request (it answers `202`); it does not claim the change happened.
+`create` and `update` take a file path or `-` (stdin), never inline JSON, and `delete` is deliberately not available outside the UI.
+
 On start the logo ripples above a steady TUIZIUM wordmark until you press **Enter** (Esc quits), then Tuizium asks for the **Kafka Connect REST API URL**
 (the address Debezium is reached at, usually port 8083) with the last profile prefilled — press Enter to accept it.
 `←/→` on the name field switches between saved profiles; a new or edited profile is saved to the config. Only the *names*
@@ -130,6 +157,9 @@ file (`tuizium.log` in the OS state/data directory); logs never go to the termin
 | `Tab`, `1`–`4` | Details panel: Overview, Tasks, Config, Trace |
 | `r` / `a` | Refresh / toggle auto refresh |
 | `f` / `s` | Cycle type / state filter |
+| `w` / `x` | Cycle worker / connector plugin filter |
+| `/`, `n`, `N` | In the Trace panel: search, next / previous match |
+| `y` | In details: copy the config or trace (secrets masked) through the terminal clipboard (OSC 52); in an error box: copy the error |
 | `o` / `O` | Cycle sort column / reverse |
 | `Space` | Mark connector for batch operations (`Esc` clears marks) |
 | `p` / `u` | Pause / resume (all marked, or the selected one) |
@@ -158,7 +188,7 @@ curl -s localhost:8083/connector-plugins | head -c 200     # wait until this ans
 tuizium --url http://localhost:8083
 ```
 
-Create connectors with `n`/`t` in Tuizium (the Debezium PostgreSQL template uses host `postgres`, port `5432`,
+Create connectors with `n`/`t` in Tuizium (the Debezium PostgreSQL and Debezium JDBC Sink templates match this stack; the Confluent JDBC Sink template needs a plugin it does not contain and is shown as not installed). The PostgreSQL template uses host `postgres`, port `5432`,
 user/password `postgres`, database `inventory`, table `public.customers`). Tear down with
 `docker compose -f examples/local-connect/docker-compose.yml down -v`. The passwords in that file are throwaway values.
 
@@ -191,6 +221,7 @@ logs stay in the Connect worker logs (`docker logs <connect>`).
 ## Security notes
 
 - Secrets are never stored: profiles hold the *names* of environment variables. URLs containing credentials are rejected.
+- Secret-looking values (keys containing password/secret/token/credential/api key/jaas, and `password=`-style URL parameters) are masked as `********` in the Config and Overview panels, in traces, in error messages and in previews. `e` (edit) still opens the real config in your editor, because saving needs the real values; Tuizium refuses to save a config that contains the `********` or `[hidden]` placeholders.
 - A warning is shown when credentials would be sent over plain `http` to a non-local host.
 - Redirects are only followed on the same host and never from https to http; response bodies are capped at 32 MiB.
 - The editor temp file is created exclusively (never through a symlink), private to your user on Unix, and deleted afterwards.
