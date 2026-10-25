@@ -124,6 +124,8 @@ pub fn default_path() -> Option<PathBuf> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Expect {
     Paused,
+    /// `PUT …/stop` (Connect 3.5+): the connector reports STOPPED, not merely PAUSED.
+    Stopped,
     Running,
     /// A just-created connector: it may legitimately be missing from the first snapshots.
     Created,
@@ -196,6 +198,18 @@ pub fn judge(w: &mut Watch, c: Option<&Connector>, elapsed: Duration) -> Option<
                     (
                         Severity::Warn,
                         format!("{n}: not paused after {}s — {}", elapsed.as_secs(), describe(c)),
+                    )
+                })
+            }
+        }
+        Expect::Stopped => {
+            if c.state == "STOPPED" {
+                Some((Severity::Ok, format!("{n}: confirmed STOPPED")))
+            } else {
+                timed_out.then(|| {
+                    (
+                        Severity::Warn,
+                        format!("{n}: not stopped after {}s — {}", elapsed.as_secs(), describe(c)),
                     )
                 })
             }

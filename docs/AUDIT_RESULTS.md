@@ -345,7 +345,7 @@ Smallest useful slices, in order.
 4. B7: confirm on a real Turkish keyboard; fix input handling if it is real.
 
 **v1.1 (safety and usability)**
-*Status 2026-10-17: v1.0.1 fixes (items 1-4 except B7), v1.1 (items 5-7) and v1.2 (item 8) are implemented and tested with a fake Kafka Connect only, and are committed together as crate version 1.2.0 (not pushed, not tagged). Not done: B7 (needs the user's Turkish keyboard), v1.3 (item 9), the live log panel and the optional integrations (items 10-11). Not verified: a run against a real cluster (the git-excluded `playground/` stack was written but never started), the new keys in a real terminal, OSC 52 delivery, Linux/macOS.*
+*Status 2026-10-17: v1.0.1 fixes (items 1-4 except B7), v1.1 (items 5-7) and v1.2 (item 8) are implemented and tested with a fake Kafka Connect only, and shipped together as crate version 1.2.0 (pushed, tagged `v1.2.0`, release workflow green with 5 binaries + checksums); B7 was an AltGr bug and is fixed. Not done: B7 (needs the user's Turkish keyboard), v1.3 (item 9), the live log panel and the optional integrations (items 10-11). Not verified: a run against a real cluster (the git-excluded `playground/` stack was written but never started), the new keys in a real terminal, OSC 52 delivery, Linux/macOS.*
 
 5. Old-vs-new diff and replay warning before update (B4) — **done** (the replay note is a heuristic on setting names and says so); target cluster in the delete dialog — **was already there**, now tested.
 6. Refuse to start without a TTY (B6) — done in v1.0.1; narrow-width column fix (B5) — **done** (plugin, type, tasks dropped in turn; below 34 columns only a state symbol).
@@ -355,7 +355,7 @@ Smallest useful slices, in order.
 8. Non-interactive subcommands `list`, `status`, `pause`, `resume`, `restart` with `--output json`, exit codes and no ANSI; `--dry-run` for create/update — **done**, plus `create`/`update` themselves and `--wait` verification. `delete` is intentionally UI-only.
 
 **v1.3 (Debezium depth, REST only)**
-9. Debezium views for capture filters, snapshot mode, slot/publication from config, with a clear "configured, not runtime" label; stop action and capability check by Connect version; read-only mode; profile removal.
+9. Debezium views for capture filters, snapshot mode, slot/publication from config, with a clear "configured, not runtime" label; stop action and capability check by Connect version; read-only mode; profile removal. **Done in 1.3.0** (not yet committed or released; see CHANGELOG for what was and was not verified).
 
 **Later (optional integrations, clearly separated)**
 10. Kafka client, Schema Registry, JMX/Prometheus metrics with explicit provenance. Never show lag or throughput without such a source.

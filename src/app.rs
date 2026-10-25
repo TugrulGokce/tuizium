@@ -225,6 +225,7 @@ pub struct Confirm {
 #[derive(Clone, Copy)]
 pub enum Op {
     Pause,
+    Stop,
     Resume,
     Restart,
     RestartFailed,
@@ -235,6 +236,7 @@ impl Op {
     fn verb(self) -> &'static str {
         match self {
             Op::Pause => "pause",
+            Op::Stop => "stop",
             Op::Resume => "resume",
             Op::Restart => "restart",
             Op::RestartFailed => "restart failed parts of",
@@ -248,6 +250,7 @@ impl Op {
     fn expect(self) -> Expect {
         match self {
             Op::Pause => Expect::Paused,
+            Op::Stop => Expect::Stopped,
             Op::Resume => Expect::Running,
             Op::Restart | Op::RestartFailed => Expect::Restarted,
             Op::Delete => Expect::Gone,
@@ -262,6 +265,7 @@ async fn apply(client: Client, op: Op, names: Vec<String>) -> Result<(), ActionE
     for n in &names {
         let r = match op {
             Op::Pause => client.pause(n).await,
+            Op::Stop => client.stop(n).await,
             Op::Resume => client.resume(n).await,
             Op::Restart => client.restart(n, false).await,
             Op::RestartFailed => client.restart(n, true).await,
@@ -330,6 +334,8 @@ pub enum Overlay {
     Confirm(Confirm),
     Clusters(usize),
     AddCluster(AddCluster),
+    /// Asks before removing the named profile from the config file.
+    RemoveCluster(String),
     Templates(usize),
     Form(Box<FormState>),
     Import(ImportState),
@@ -402,6 +408,8 @@ pub struct App {
     pub screen: Screen,
     /// Show the connection form after the splash (see `Config::ask_on_start`).
     ask_setup: bool,
+    /// `--read-only` on the command line: applies to every cluster, on top of the profile setting.
+    force_read_only: bool,
 }
 
 /// Which full-screen view is active.
@@ -476,6 +484,7 @@ impl App {
             dirty: true,
             screen: Screen::Main,
             ask_setup: false,
+            force_read_only: false,
         };
         if connect {
             app.use_cluster(&cluster);
@@ -633,6 +642,15 @@ impl App {
         self.dirty = true;
     }
 
+    pub fn set_read_only(&mut self, on: bool) {
+        self.force_read_only = on;
+    }
+
+    /// True when `--read-only` was given or the current cluster's profile has `read_only = true`.
+    pub fn read_only(&self) -> bool {
+        self.force_read_only || self.config.clusters.get(&self.cluster).is_some_and(|c| c.is_read_only())
+    }
+
     fn run_action<F, Fut>(
         &mut self,
         label: String,
@@ -643,6 +661,11 @@ impl App {
         F: FnOnce(Client) -> Fut,
         Fut: Future<Output = Result<(), ActionError>> + Send + 'static,
     {
+        // Every change to a cluster goes through here, so this is the backstop behind the key guard.
+        if self.read_only() {
+            self.error_overlay(format!("{label}: refused — read-only mode"));
+            return;
+        }
         let Some(client) = self.client.clone() else {
             self.error_overlay(format!("{label}: not connected to a cluster"));
             return;
@@ -701,7 +724,7 @@ impl App {
             Msg::Tick => {
                 self.dirty = true; // keeps "refreshed Ns ago" and toasts current
                 if let Some(t) = &self.toast {
-                    let ttl = if t.level == Level::Info { 6 } else { 12 };
+                    let ttl = if t.level == Level::Info { 3 } else { 6 };
                     if t.at.elapsed() > Duration::from_secs(ttl) {
                         self.toast = None;
                     }
@@ -1130,7 +1153,22 @@ impl App {
                     self.nav(1);
                 }
             }
+            KeyCode::Char('p' | 'u' | 'S' | 'R' | 'F' | 'd' | 'e' | 'n' | 't') if self.read_only() => {
+                self.toast("read-only mode: changing connectors is disabled".into(), Level::Warn);
+            }
             KeyCode::Char('p') => self.batch(Op::Pause, self.targets()),
+            KeyCode::Char('S') => {
+                let supported = matches!(&self.conn, Conn::Connected(Some(r)) if r.supports_stop());
+                if supported {
+                    self.batch(Op::Stop, self.targets());
+                } else {
+                    self.toast(
+                        "stop needs Kafka Connect 3.5 or newer (this cluster's version is unknown or older); use p to pause"
+                            .into(),
+                        Level::Warn,
+                    );
+                }
+            }
             KeyCode::Char('u') => self.batch(Op::Resume, self.targets()),
             KeyCode::Char('R') => self.restart_selected(),
             KeyCode::Char('F') => {
@@ -1369,6 +1407,14 @@ impl App {
                 _ => Overlay::Confirm(c),
             },
             Overlay::Clusters(sel) => self.on_clusters_key(sel, key),
+            Overlay::RemoveCluster(name) => match code {
+                KeyCode::Char('y' | 'Y') => {
+                    self.remove_cluster(&name);
+                    Overlay::Clusters(0)
+                }
+                KeyCode::Esc | KeyCode::Char('n' | 'N' | 'q') => Overlay::Clusters(0),
+                _ => Overlay::RemoveCluster(name),
+            },
             Overlay::AddCluster(mut a) => match code {
                 KeyCode::Esc => Overlay::Clusters(0),
                 KeyCode::Enter => match self.add_cluster(&a.input) {
@@ -1541,6 +1587,21 @@ impl App {
             }
             KeyCode::Up | KeyCode::Char('k') => Overlay::Clusters(sel.saturating_sub(1)),
             KeyCode::Char('a') => Overlay::AddCluster(AddCluster { input: String::new(), error: None }),
+            KeyCode::Char('d') => match names.get(sel) {
+                Some(name) if *name == self.cluster => {
+                    self.toast(
+                        "cannot remove the profile in use; switch to another one first".into(),
+                        Level::Warn,
+                    );
+                    Overlay::Clusters(sel)
+                }
+                Some(_) if names.len() <= 1 => {
+                    self.toast("cannot remove the only profile".into(), Level::Warn);
+                    Overlay::Clusters(sel)
+                }
+                Some(name) => Overlay::RemoveCluster(name.clone()),
+                None => Overlay::Clusters(sel),
+            },
             KeyCode::Char(c @ '1'..='9') if (c as usize - '1' as usize) < names.len() => {
                 let name = names[c as usize - '1' as usize].clone();
                 self.use_cluster(&name);
@@ -1553,6 +1614,27 @@ impl App {
                 Overlay::None
             }
             _ => Overlay::Clusters(sel),
+        }
+    }
+
+    /// Removes a profile from memory and the config file. Environment variables it named are untouched.
+    fn remove_cluster(&mut self, name: &str) {
+        if name == self.cluster || self.config.clusters.len() <= 1 {
+            return;
+        }
+        if self.config.clusters.remove(name).is_none() {
+            return;
+        }
+        if self.config.default_cluster.as_deref() == Some(name) {
+            self.config.default_cluster = None;
+        }
+        let saved = match &self.config_path {
+            Some(path) => config::save(path, &self.config).map_err(|e| format!("{e:#}")),
+            None => Ok(()),
+        };
+        match saved {
+            Ok(()) => self.toast(format!("profile {name:?} removed"), Level::Info),
+            Err(e) => self.toast(format!("profile {name:?} removed in memory only: {e}"), Level::Error),
         }
     }
 
@@ -2088,6 +2170,7 @@ mod tests {
     struct Fake {
         requests: Vec<String>,
         paused: bool,
+        stopped: bool,
         deleted: bool,
         /// Number of list calls answered since a restart was requested.
         restart_polls: Option<u32>,
@@ -2132,6 +2215,9 @@ mod tests {
                                 if f.paused {
                                     c1 = ("PAUSED", "PAUSED");
                                 }
+                                if f.stopped {
+                                    c1 = ("STOPPED", "STOPPED");
+                                }
                                 if let Some(p) = f.restart_polls {
                                     if p < f.restarting_polls {
                                         c1 = ("RESTARTING", "RESTARTING");
@@ -2159,8 +2245,13 @@ mod tests {
                                 f.paused = true;
                                 (202, String::new())
                             }
+                            ("PUT", "/connectors/c1/stop") => {
+                                f.stopped = true;
+                                (202, String::new())
+                            }
                             ("PUT", "/connectors/c1/resume") => {
                                 f.paused = false;
+                                f.stopped = false;
                                 (202, String::new())
                             }
                             ("PUT", "/connectors/c2/resume") => {
@@ -2292,6 +2383,61 @@ mod tests {
         assert_eq!(app.selected().unwrap().state, "PAUSED");
         app.on_key(KeyEvent::from(KeyCode::Char('u')));
         pump(&mut app, &mut rx, |a| journal(a).contains("confirmed RUNNING")).await;
+    }
+
+    #[tokio::test]
+    async fn stop_is_verified_and_resume_brings_the_connector_back() {
+        let (url, fake) = fake_connect().await;
+        let (mut app, mut rx) = live_app(&url).await;
+        // The fake reports Connect 3.9.0, so S is allowed.
+        pump(&mut app, &mut rx, |a| matches!(&a.conn, Conn::Connected(Some(_)))).await;
+        app.on_key(KeyEvent::from(KeyCode::Char('S')));
+        pump(&mut app, &mut rx, |a| journal(a).contains("c1: confirmed STOPPED")).await;
+        assert!(fake.lock().unwrap().requests.iter().any(|r| r.starts_with("PUT /connectors/c1/stop")));
+        app.on_key(KeyEvent::from(KeyCode::Char('u')));
+        pump(&mut app, &mut rx, |a| journal(a).contains("confirmed RUNNING")).await;
+    }
+
+    #[tokio::test]
+    async fn read_only_blocks_every_change_from_flag_or_profile() {
+        for by_profile in [false, true] {
+            let (url, fake) = fake_connect().await;
+            let (mut app, mut rx) = live_app(&url).await;
+            if by_profile {
+                app.config.clusters.get_mut("local").unwrap().read_only = Some(true);
+            } else {
+                app.set_read_only(true);
+            }
+            assert!(app.read_only());
+            for k in ['p', 'u', 'S', 'R', 'F', 'd', 'e', 'n', 't'] {
+                app.on_key(KeyEvent::from(KeyCode::Char(k)));
+                assert!(matches!(app.overlay, Overlay::None), "{k} opened an overlay");
+                assert!(app.editor_request.is_none(), "{k} requested the editor");
+                assert!(matches!(&app.toast, Some(t) if t.text.contains("read-only")), "{k}");
+            }
+            // The backstop refuses even if a caller bypasses the key guard.
+            app.run_action("x".into(), None, vec![], |_| async { Ok(()) });
+            assert!(matches!(&app.overlay, Overlay::Error(t) if t.contains("read-only")));
+            // Give any (wrongly) spawned request time to arrive, then check nothing mutating was sent.
+            while let Ok(m) = rx.try_recv() {
+                app.update(m);
+            }
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            let reqs = fake.lock().unwrap().requests.clone();
+            assert!(reqs.iter().all(|r| r.starts_with("GET ")), "{reqs:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn stop_is_refused_on_unknown_or_old_connect_versions() {
+        let (url, fake) = fake_connect().await;
+        let (mut app, _rx) = live_app(&url).await;
+        app.conn = Conn::Connected(Some(RootInfo { version: "3.4.1".into() }));
+        app.on_key(KeyEvent::from(KeyCode::Char('S')));
+        assert!(matches!(&app.toast, Some(t) if t.text.contains("3.5")));
+        app.conn = Conn::Connected(None);
+        app.on_key(KeyEvent::from(KeyCode::Char('S')));
+        assert!(!fake.lock().unwrap().requests.iter().any(|r| r.contains("/stop")));
     }
 
     #[tokio::test]
@@ -2438,6 +2584,37 @@ mod tests {
             "a missing env var must not block saving"
         );
         assert!(app.config.clusters.contains_key("p"));
+    }
+
+    #[tokio::test]
+    async fn profiles_can_be_removed_but_not_the_active_or_the_last_one() {
+        let (mut app, _rx) = app();
+        app.add_cluster("p http://h:1").unwrap();
+        app.config.default_cluster = Some("p".into());
+        let sel = app.config.clusters.keys().position(|k| k == "p").unwrap();
+        let other = 1 - sel;
+        // Active profile ("local") is refused.
+        app.overlay = Overlay::Clusters(other);
+        app.on_key(KeyEvent::from(KeyCode::Char('d')));
+        assert!(matches!(app.overlay, Overlay::Clusters(_)), "active profile must not be removable");
+        // Another profile asks first; Esc keeps it.
+        app.overlay = Overlay::Clusters(sel);
+        app.on_key(KeyEvent::from(KeyCode::Char('d')));
+        assert!(matches!(&app.overlay, Overlay::RemoveCluster(n) if n == "p"));
+        app.on_key(KeyEvent::from(KeyCode::Esc));
+        assert!(app.config.clusters.contains_key("p"));
+        // Confirming removes it and clears a default that pointed at it.
+        app.overlay = Overlay::Clusters(sel);
+        app.on_key(KeyEvent::from(KeyCode::Char('d')));
+        app.on_key(KeyEvent::from(KeyCode::Char('y')));
+        assert!(!app.config.clusters.contains_key("p"));
+        assert_eq!(app.config.default_cluster, None);
+        // The only profile left is the active one and stays.
+        app.overlay = Overlay::Clusters(0);
+        app.on_key(KeyEvent::from(KeyCode::Char('d')));
+        assert!(app.config.clusters.contains_key("local"));
+        app.remove_cluster("local");
+        assert!(app.config.clusters.contains_key("local"));
     }
 
     #[tokio::test]

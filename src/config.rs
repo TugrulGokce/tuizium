@@ -23,6 +23,15 @@ pub struct Cluster {
     pub token_env: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout_secs: Option<u64>,
+    /// Refuse every change to this cluster (pause, stop, restart, delete, create, update, edit).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub read_only: Option<bool>,
+}
+
+impl Cluster {
+    pub fn is_read_only(&self) -> bool {
+        self.read_only.unwrap_or(false)
+    }
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
@@ -159,6 +168,24 @@ mod tests {
         // Serialized form never contains secret material, only variable names.
         let s = toml::to_string_pretty(&Config::with_local_default()).unwrap();
         assert!(!s.contains("password ="));
+    }
+
+    #[test]
+    fn read_only_is_off_unless_the_profile_says_so() {
+        let cfg: Config = toml::from_str(
+            r#"
+            [clusters.a]
+            url = "http://a:8083"
+            [clusters.b]
+            url = "http://b:8083"
+            read_only = true
+            "#,
+        )
+        .unwrap();
+        assert!(!cfg.clusters["a"].is_read_only());
+        assert!(cfg.clusters["b"].is_read_only());
+        // Default profiles do not write the key at all.
+        assert!(!toml::to_string_pretty(&Config::with_local_default()).unwrap().contains("read_only"));
     }
 
     #[test]

@@ -31,6 +31,8 @@ pub struct Global {
     pub url: Option<String>,
     pub config: Option<PathBuf>,
     pub no_splash: bool,
+    /// Refuse every command that changes the cluster (dry runs are still allowed).
+    pub read_only: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -64,6 +66,7 @@ pub enum Command {
     Status { name: String, output: Output },
     Pause { names: Vec<String>, wait: bool, output: Output },
     Resume { names: Vec<String>, wait: bool, output: Output },
+    Stop { names: Vec<String>, wait: bool, output: Output },
     Restart { names: Vec<String>, only_failed: bool, wait: bool, output: Output },
     Create { file: String, dry_run: bool, wait: bool, output: Output },
     Update { file: String, dry_run: bool, wait: bool, output: Output },
@@ -89,7 +92,7 @@ struct Opts {
     given: Vec<&'static str>,
 }
 
-const COMMANDS: &str = "list, status, pause, resume, restart, create, update";
+const COMMANDS: &str = "list, status, pause, resume, stop, restart, create, update";
 
 /// Parses everything after the program name. `Err` is a usage error (exit code 2).
 pub fn parse(args: &[String]) -> Result<Parsed, String> {
@@ -122,6 +125,7 @@ pub fn parse(args: &[String]) -> Result<Parsed, String> {
             }
             "--config" => global.config = Some(value("--config")?.into()),
             "--no-splash" => global.no_splash = true,
+            "--read-only" => global.read_only = true,
             "-o" | "--output" => {
                 opts.given.push("--output");
                 opts.output = Some(match value("--output")?.as_str() {
@@ -183,7 +187,7 @@ pub fn parse(args: &[String]) -> Result<Parsed, String> {
     let allowed: &[&str] = match cmd.as_str() {
         "list" => &["--output", "--state", "--type"],
         "status" => &["--output"],
-        "pause" | "resume" => &["--output", "--wait"],
+        "pause" | "resume" | "stop" => &["--output", "--wait"],
         "restart" => &["--output", "--wait", "--only-failed"],
         "create" | "update" => &["--output", "--wait", "--dry-run"],
         other => return Err(format!("unknown command {other:?} (expected one of: {COMMANDS})")),
@@ -213,6 +217,7 @@ pub fn parse(args: &[String]) -> Result<Parsed, String> {
         "resume" => {
             Command::Resume { names: at_least_one("resume <name>... [--wait]")?, wait: opts.wait, output }
         }
+        "stop" => Command::Stop { names: at_least_one("stop <name>... [--wait]")?, wait: opts.wait, output },
         "restart" => Command::Restart {
             names: at_least_one("restart <name>... [--only-failed] [--wait]")?,
             only_failed: opts.only_failed,
@@ -244,7 +249,8 @@ pub async fn run(global: Global, command: Command) -> i32 {
     }
 }
 
-fn connect(g: &Global) -> Result<(String, Client)> {
+/// Returns the cluster name, its client, and whether changes are forbidden (`--read-only` or profile).
+fn connect(g: &Global) -> Result<(String, Client, bool)> {
     let (name, cluster) = if let Some(url) = &g.url {
         ("adhoc".to_string(), Cluster { url: url.clone(), ..Default::default() })
     } else {
@@ -263,7 +269,19 @@ fn connect(g: &Global) -> Result<(String, Client)> {
         };
         (name, cluster)
     };
-    Ok((name, cluster.client()?))
+    let read_only = g.read_only || cluster.is_read_only();
+    Ok((name, cluster.client()?, read_only))
+}
+
+/// Whether the command changes the cluster; a dry run only validates.
+fn mutates(c: &Command) -> bool {
+    match c {
+        Command::List { .. } | Command::Status { .. } => false,
+        Command::Create { dry_run, .. } | Command::Update { dry_run, .. } => !dry_run,
+        Command::Pause { .. } | Command::Resume { .. } | Command::Stop { .. } | Command::Restart { .. } => {
+            true
+        }
+    }
 }
 
 fn healthy(c: &Connector) -> bool {
@@ -319,7 +337,10 @@ fn print_json(v: &Value) {
 }
 
 async fn execute(global: Global, command: Command) -> Result<i32> {
-    let (cluster, client) = connect(&global)?;
+    let (cluster, client, read_only) = connect(&global)?;
+    if read_only && mutates(&command) {
+        bail!("refused: read-only mode (--read-only or `read_only = true` in the profile of {cluster:?})");
+    }
     match command {
         Command::List { state, kind, output } => list(&cluster, &client, state, kind, output).await,
         Command::Status { name, output } => status(&cluster, &client, &name, output).await,
@@ -332,6 +353,19 @@ async fn execute(global: Global, command: Command) -> Result<i32> {
         Command::Resume { names, wait, output } => {
             mutate(&cluster, &client, "resume", names, Expect::Running, wait, output, |c, n| {
                 Box::pin(async move { c.resume(&n).await })
+            })
+            .await
+        }
+        Command::Stop { names, wait, output } => {
+            let root = client.root().await?;
+            if !root.supports_stop() {
+                bail!(
+                    "stop needs Kafka Connect 3.5 or newer; this cluster reports version {:?}. Use `pause` instead.",
+                    root.version
+                );
+            }
+            mutate(&cluster, &client, "stop", names, Expect::Stopped, wait, output, |c, n| {
+                Box::pin(async move { c.stop(&n).await })
             })
             .await
         }
@@ -767,12 +801,30 @@ mod tests {
     }
 
     #[test]
+    fn read_only_flag_is_global_and_only_changes_count_as_mutations() {
+        let Parsed::Cmd(g, c) = p(&["--read-only", "stop", "a"]).unwrap() else { panic!("not a command") };
+        assert!(g.read_only);
+        assert!(mutates(&c));
+        for args in [vec!["list"], vec!["status", "a"], vec!["create", "f.json", "--dry-run"]] {
+            let Parsed::Cmd(_, c) = p(&args).unwrap() else { panic!("not a command") };
+            assert!(!mutates(&c), "{args:?}");
+        }
+        for args in [vec!["pause", "a"], vec!["resume", "a"], vec!["restart", "a"], vec!["update", "-"]] {
+            let Parsed::Cmd(_, c) = p(&args).unwrap() else { panic!("not a command") };
+            assert!(mutates(&c), "{args:?}");
+        }
+        assert!(matches!(p(&["--read-only"]).unwrap(), Parsed::Tui(g) if g.read_only));
+    }
+
+    #[test]
     fn usage_errors_are_specific() {
         for (args, needle) in [
             (vec!["frobnicate"], "unknown command"),
             (vec!["list", "extra"], "usage: tuizium list"),
             (vec!["status"], "usage: tuizium status"),
             (vec!["pause"], "usage: tuizium pause"),
+            (vec!["stop"], "usage: tuizium stop"),
+            (vec!["stop", "a", "--dry-run"], "not valid for `stop`"),
             (vec!["list", "--dry-run"], "not valid for `list`"),
             (vec!["pause", "a", "--only-failed"], "not valid for `pause`"),
             (vec!["--output", "json"], "needs a subcommand"),

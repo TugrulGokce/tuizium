@@ -229,6 +229,38 @@ fn mask_params(s: &str) -> String {
     out
 }
 
+/// Masks the password in URL user-info (`mongodb://user:pw@host/db` -> `mongodb://user:********@host/db`).
+fn mask_userinfo(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(i) = rest.find("://") {
+        let auth_start = i + 3;
+        out.push_str(&rest[..auth_start]);
+        rest = &rest[auth_start..];
+        let auth_end = rest.find(['/', '?', '#', ' ', '"', '\'', '\n', '\r', '\t']).unwrap_or(rest.len());
+        let (auth, tail) = rest.split_at(auth_end);
+        match auth.rfind('@') {
+            Some(at) => match auth[..at].split_once(':') {
+                Some((user, _)) => {
+                    out.push_str(user);
+                    out.push(':');
+                    out.push_str(MASK);
+                    out.push_str(&auth[at..]);
+                }
+                None => out.push_str(auth),
+            },
+            None => out.push_str(auth),
+        }
+        rest = tail;
+    }
+    out.push_str(rest);
+    out
+}
+
+fn mask_string(s: &str) -> String {
+    mask_userinfo(&mask_params(s))
+}
+
 /// Returns a copy of the config with secret-looking values masked, for display.
 /// Config-provider references such as `${env:VAR}` are not secrets and stay visible.
 pub fn masked(cfg: &Map<String, Value>) -> Map<String, Value> {
@@ -240,7 +272,7 @@ pub fn masked(cfg: &Map<String, Value>) -> Map<String, Value> {
             } else if is_secret_key(k) {
                 Value::String(MASK.into())
             } else if let Some(s) = v.as_str() {
-                Value::String(mask_params(s))
+                Value::String(mask_string(s))
             } else {
                 v.clone()
             };
@@ -251,12 +283,29 @@ pub fn masked(cfg: &Map<String, Value>) -> Map<String, Value> {
 
 /// Masks `name=value` secrets inside one displayed string (e.g. a JDBC URL).
 pub fn mask_text(s: &str) -> String {
-    mask_params(s)
+    mask_string(s)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn url_user_info_passwords_are_masked() {
+        for (input, want) in [
+            ("mongodb://u:pw@h1:27017,h2:27017/db?rs=r", "mongodb://u:********@h1:27017,h2:27017/db?rs=r"),
+            ("jdbc:postgresql://admin:s3cret@db/x", "jdbc:postgresql://admin:********@db/x"),
+            ("https://host/path?a=b", "https://host/path?a=b"),
+            ("http://user@host/x", "http://user@host/x"),
+            (
+                "postgres://a:b@c/d and mysql://e:f@g/h",
+                "postgres://a:********@c/d and mysql://e:********@g/h",
+            ),
+            ("no url at all", "no url at all"),
+        ] {
+            assert_eq!(mask_text(input), want);
+        }
+    }
 
     #[test]
     fn every_template_builds_with_defaults() {

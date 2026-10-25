@@ -12,13 +12,19 @@ Keyboard-driven, lightweight, in the spirit of k9s / lazydocker / htop. Works wi
 other Kafka Connect connector. Every action uses the official
 [Kafka Connect REST API](https://kafka.apache.org/documentation/#connect_rest).
 
+<p align="center">
+  <img src="assets/tuizium.gif" alt="Tuizium demo: browsing connectors, pausing, resuming and restarting them, and reading a failed task's stack trace" width="800">
+</p>
+
 ## Features
 
 - Multiple cluster profiles, switch with `c`; basic auth and bearer tokens (secrets via env vars only)
 - Connector table: name, type, state, tasks (running/total), plugin; search, type/state filters, sorting,
   manual + automatic refresh, failed connectors highlighted
 - Details: overview, task states, config JSON, failure traces
-- Actions: pause, resume, restart (connector or single task), delete (confirmed), create from JSON file / inline JSON
+- Actions: pause, resume, stop (Kafka Connect 3.5+), restart (connector or single task), delete (confirmed), create from JSON file / inline JSON
+- Debezium connectors: capture filters, snapshot mode, slot and publication as the config states them (labelled "configured, not runtime")
+- Read-only mode (`--read-only` or `read_only = true` in a profile) refuses every change
 - Templates (Debezium PostgreSQL, Debezium MySQL, Debezium JDBC Sink, Confluent JDBC Sink) with editable fields, masked JSON preview and confirmation; a template whose plugin the cluster does not have is marked and cannot be opened
 - Never blocks the UI on network calls; handles timeouts and unreachable clusters; restores the terminal on exit/panic
 
@@ -84,6 +90,7 @@ tuizium                       # opening animation, then asks where Kafka Connect
 tuizium --cluster prod        # start on a profile, skipping the question
 tuizium --url http://host:8083
 tuizium --no-splash           # skip the opening screen (or set TUIZIUM_NO_SPLASH)
+tuizium --read-only           # look, but refuse every change (also for the commands below)
 ```
 
 Tuizium needs an interactive terminal for the UI: if stdin or stdout is a pipe or a file it prints an error and exits with code 1 (`--help`, `--version` and the commands below work anywhere).
@@ -98,6 +105,7 @@ tuizium --url http://localhost:8083 list                      # table; add --sta
 tuizium --url http://localhost:8083 status my-connector -o json
 tuizium --url http://localhost:8083 pause my-connector --wait     # --wait polls up to 15 s and says whether it really paused
 tuizium --url http://localhost:8083 resume a b c
+tuizium --url http://localhost:8083 stop my-connector --wait     # Kafka Connect 3.5+; tasks are removed, resume brings it back
 tuizium --url http://localhost:8083 restart my-connector --only-failed --wait
 tuizium --url http://localhost:8083 update my-connector.json --dry-run   # validate + show the diff, send nothing
 tuizium --url http://localhost:8083 create my-connector.json      # or "-" to read the JSON from stdin
@@ -141,9 +149,10 @@ password_env = "PROD_CONNECT_PASSWORD"   # name of an env var — passwords are 
 url = "https://connect.example.org"
 token_env = "CLOUD_CONNECT_TOKEN"        # bearer token from an env var
 timeout_secs = 15
+read_only = true                         # this profile refuses every change (like --read-only)
 ```
 
-You can also add profiles inside the app (`c`, then `a`). Set `TUIZIUM_LOG=debug` to write diagnostics to a log
+You can also add profiles inside the app (`c`, then `a`; `d` removes one after asking, never the active or the last one). Set `TUIZIUM_LOG=debug` to write diagnostics to a log
 file (`tuizium.log` in the OS state/data directory); logs never go to the terminal.
 
 ### Keys
@@ -163,6 +172,7 @@ file (`tuizium.log` in the OS state/data directory); logs never go to the termin
 | `o` / `O` | Cycle sort column / reverse |
 | `Space` | Mark connector for batch operations (`Esc` clears marks) |
 | `p` / `u` | Pause / resume (all marked, or the selected one) |
+| `S` | Stop connector(s) (needs Kafka Connect 3.5+; `u` brings them back) |
 | `R` | Restart connector(s) (restart selected task in the Tasks panel) |
 | `F` | Restart only failed connectors/tasks (marked, or every failed one) |
 | `e` | Edit the config in `$VISUAL`/`$EDITOR`, validate, preview, save (`PUT /connectors/{name}/config`) |
@@ -171,7 +181,7 @@ file (`tuizium.log` in the OS state/data directory); logs never go to the termin
 | `d` | Delete (asks for confirmation, `y`) |
 | `n` | New connector from a JSON file path or inline JSON |
 | `t` | New connector from a template |
-| `c` | Switch cluster (`a` adds a profile) |
+| `c` | Switch cluster (`a` adds a profile, `d` removes one) |
 | `?` | Help |
 | `q`, `Ctrl+C` | Quit |
 

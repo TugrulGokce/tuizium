@@ -4,6 +4,7 @@ mod app;
 mod cli;
 mod clip;
 mod config;
+mod debezium;
 mod diff;
 mod setup;
 mod splash;
@@ -37,6 +38,7 @@ OPTIONS:
     -u, --url <URL>        Use an ad-hoc Kafka Connect URL (no auth)
         --config <PATH>    Use a specific config file
         --no-splash        Skip the opening animation (UI only)
+        --read-only        Refuse every change (also per profile: read_only = true)
     -h, --help             Print help
     -V, --version          Print version
 
@@ -44,7 +46,8 @@ COMMANDS (plain text or --output json; no colours, no prompts):
     list [--state S] [--type T]          List connectors (S: running|paused|failed|unassigned, T: source|sink)
     status <name>                        One connector: state, tasks, masked config and traces
     pause <name>... [--wait]             Pause connectors
-    resume <name>... [--wait]            Resume connectors
+    resume <name>... [--wait]            Resume connectors (also resumes stopped ones)
+    stop <name>... [--wait]              Stop connectors (Kafka Connect 3.5+; tasks are removed)
     restart <name>... [--only-failed] [--wait]
                                          Restart connectors and their tasks
     create <file|-> [--dry-run] [--wait]   Create a connector from a JSON file or stdin
@@ -139,6 +142,7 @@ async fn main() -> Result<ExitCode> {
     // Created before the terminal switches modes so errors print normally.
     // Nothing connects until the connection screen (or the splash) hands over.
     let mut app = App::new_with(cfg, path, cluster, tx.clone(), false);
+    app.set_read_only(args.read_only);
     app.set_activity_file(activity::default_path());
     app.start_screens(splash, ask);
     spawn_background(tx.clone());

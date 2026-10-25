@@ -4,7 +4,7 @@ use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Block, Cell, Clear, List, ListItem, Paragraph, Row, Table, Tabs, Wrap};
+use ratatui::widgets::{Block, Cell, Clear, List, ListItem, Padding, Paragraph, Row, Table, Tabs, Wrap};
 
 use crate::activity::Severity;
 use crate::api::{Connector, Kind};
@@ -71,6 +71,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     draw_details(f, app, detail_area);
     draw_footer(f, app, footer);
     draw_overlay(f, app);
+    draw_toast(f, app);
 }
 
 fn draw_header(f: &mut Frame, app: &App, area: Rect) {
@@ -78,6 +79,10 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
         Span::styled(" Tuizium ", Style::new().fg(Color::Black).bg(ACCENT).add_modifier(Modifier::BOLD)),
         Span::raw("  cluster "),
         Span::styled(app.cluster.clone(), Style::new().fg(ACCENT).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            if app.read_only() { " READ-ONLY " } else { "" },
+            Style::new().fg(Color::Black).bg(WARN).add_modifier(Modifier::BOLD),
+        ),
         Span::styled(
             format!(
                 "  ({} profile{})",
@@ -433,6 +438,32 @@ fn overview(c: &Connector, app: &App) -> Text<'static> {
             lines.push(kv(key, Span::raw(crate::templates::mask_text(v))));
         }
     }
+    if let Some(rows) = crate::debezium::view(&c.class, &c.config) {
+        lines.push(Line::raw(""));
+        lines.push(Line::styled(
+            "Debezium · configured (from the connector config, not runtime state)",
+            Style::new().fg(ACCENT).add_modifier(Modifier::BOLD),
+        ));
+        lines.push(Line::styled(
+            "Tuizium does not read the database, replication slot or snapshot progress.",
+            Style::new().fg(DIM),
+        ));
+        for r in rows {
+            let key = Span::styled(format!("{:<30} ", r.key), Style::new().fg(DIM));
+            let mut spans = vec![key];
+            match r.value {
+                Some(v) => spans.push(Span::raw(v)),
+                None => spans.push(Span::styled("not set in config", Style::new().fg(DIM))),
+            }
+            if let Some(n) = r.entries {
+                spans.push(Span::styled(
+                    format!("  ({n} {})", if n == 1 { "entry" } else { "entries" }),
+                    Style::new().fg(DIM),
+                ));
+            }
+            lines.push(Line::from(spans));
+        }
+    }
     let failed = c.tasks.iter().filter(|t| t.state == "FAILED").count();
     if c.state == "FAILED" || failed > 0 {
         lines.push(Line::raw(""));
@@ -521,12 +552,9 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
             Span::styled("▌", Style::new().fg(ACCENT)),
             Span::styled("   Enter keep · Esc clear", Style::new().fg(DIM)),
         ])
-    } else if let Some(t) = &app.toast {
-        let color = match t.level {
-            Level::Error => ERR,
-            Level::Warn => WARN,
-            Level::Info => ACCENT,
-        };
+    } else if let Some(t) = app.toast.as_ref().filter(|_| !matches!(app.overlay, Overlay::None)) {
+        // Without an overlay the toast is drawn as a box in the middle of the screen instead.
+        let color = toast_color(t.level);
         Line::styled(
             format!(" {}", truncate(&t.text, (area.width as usize).saturating_sub(2))),
             Style::new().fg(color),
@@ -553,6 +581,68 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
         Line::from(spans)
     };
     f.render_widget(Paragraph::new(second), l2);
+}
+
+fn toast_color(level: Level) -> Color {
+    match level {
+        Level::Error => ERR,
+        Level::Warn => WARN,
+        Level::Info => ACCENT,
+    }
+}
+
+/// The toast text with the connector it is about (the longest known name that stands alone in it) in white.
+fn toast_line(app: &App, text: &str, color: Color) -> Line<'static> {
+    let is_name_char = |c: char| c.is_alphanumeric() || matches!(c, '-' | '_' | '.');
+    let found = app
+        .connectors
+        .iter()
+        .filter_map(|c| {
+            let n = c.name.as_str();
+            text.match_indices(n)
+                .find(|&(i, _)| {
+                    !text[..i].chars().next_back().is_some_and(is_name_char)
+                        && !text[i + n.len()..].chars().next().is_some_and(is_name_char)
+                })
+                .map(|(i, _)| (i, n.len()))
+        })
+        .max_by_key(|&(_, len)| len);
+    match found {
+        Some((i, len)) => Line::from(vec![
+            Span::styled(text[..i].to_string(), Style::new().fg(color)),
+            Span::styled(
+                text[i..i + len].to_string(),
+                Style::new().fg(Color::White).add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+            ),
+            Span::styled(text[i + len..].to_string(), Style::new().fg(color)),
+        ]),
+        None => Line::styled(text.to_string(), Style::new().fg(color)),
+    }
+}
+
+/// Short-lived notice (action results, hints) boxed in the middle of the screen, where it is hard to miss.
+fn draw_toast(f: &mut Frame, app: &App) {
+    if app.searching || !matches!(app.overlay, Overlay::None) {
+        return;
+    }
+    let Some(t) = &app.toast else { return };
+    let color = toast_color(t.level);
+    let area = f.area();
+    let w = (t.text.chars().count() as u16)
+        .saturating_add(4)
+        .clamp(24, area.width.saturating_sub(4).clamp(24, 70));
+    let inner_w = usize::from(w.saturating_sub(4)).max(1);
+    let lines = t.text.chars().count().div_ceil(inner_w).clamp(1, 4) as u16;
+    let rect = centered(area, w, lines + 2);
+    f.render_widget(Clear, rect);
+    f.render_widget(
+        Paragraph::new(toast_line(app, &t.text, color))
+            .style(Style::new().fg(color).add_modifier(Modifier::BOLD))
+            .alignment(Alignment::Center)
+            .wrap(Wrap { trim: true })
+            .block(Block::bordered().border_style(Style::new().fg(color)).padding(Padding::horizontal(1))),
+        rect,
+    );
 }
 
 // ---- overlays -------------------------------------------------------------
@@ -616,7 +706,27 @@ fn draw_overlay(f: &mut Frame, app: &App) {
                 })
                 .collect();
             f.render_widget(List::new(items), body);
-            f.render_widget(hints(&[("⏎/1-9", "switch"), ("a", "add profile"), ("Esc", "close")]), foot);
+            f.render_widget(
+                hints(&[
+                    ("⏎/1-9", "switch"),
+                    ("a", "add profile"),
+                    ("d", "remove profile"),
+                    ("Esc", "close"),
+                ]),
+                foot,
+            );
+        }
+        Overlay::RemoveCluster(name) => {
+            let inner = popup(f, 64, 7, "Remove profile", ERR);
+            let [body, foot] = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(inner);
+            f.render_widget(
+                Paragraph::new(format!(
+                    "Remove profile \"{name}\" from the config file?\nThe cluster itself and any environment variables are not touched."
+                ))
+                .wrap(Wrap { trim: false }),
+                body,
+            );
+            f.render_widget(hints(&[("y", "remove"), ("Esc", "cancel")]), foot);
         }
         Overlay::AddCluster(a) => {
             let inner = popup(f, 78, 8, "Add cluster profile", ACCENT);
@@ -913,6 +1023,7 @@ fn draw_help(f: &mut Frame) {
         ("r / a", "Refresh now / toggle auto refresh"),
         ("Space", "Mark connector (batch p/u/R/d/F act on marks)"),
         ("p / u", "Pause / resume connector(s)"),
+        ("S", "Stop connector(s), Connect 3.5+ (u resumes)"),
         ("R", "Restart connector(s) (task, in Tasks panel)"),
         ("F", "Restart only failed parts (marked, or all failed)"),
         ("e", "Edit config in $EDITOR, validate, then save"),
@@ -921,7 +1032,7 @@ fn draw_help(f: &mut Frame) {
         ("d", "Delete (with confirmation)"),
         ("n", "New connector from JSON file / inline"),
         ("t", "New connector from template"),
-        ("c", "Switch cluster (a: add profile)"),
+        ("c", "Switch cluster (a: add profile, d: remove profile)"),
         ("?", "This help"),
         ("q, Ctrl+C", "Quit"),
     ];

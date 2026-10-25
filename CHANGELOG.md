@@ -5,6 +5,32 @@ Versions 1.0.1, 1.1.0 and 1.2.0 were developed one after the other and are commi
 Connect 3.9.0, but 1.1.0 and 1.2.0 have not yet been run against a real cluster or in a real terminal, and nothing has been run
 against a multi-worker cluster.
 
+## 1.3.0 — Debezium depth, REST only (roadmap v1.3)
+
+Tests use a fake Kafka Connect (140 tests). Also checked against the single-worker playground (Connect 3.9.0, Debezium 3.0.8):
+- CLI: `stop`/`resume --wait`, `create`/`update --dry-run`, `create --wait`, the `--read-only` refusal, malformed input (bad JSON, `../` and `/` in names,
+  empty `--url`, unreachable server), and a canary secret that never appeared in any output.
+- UI, driven in a Windows pseudo-terminal (ConPTY, not a real terminal emulator): the Debezium view on PostgreSQL, MongoDB and MySQL sources and its absence on
+  a non-Debezium connector, `S` then `L` (journal shows confirmed STOPPED), `u`, the `READ-ONLY` badge and refused keys, refusal to remove the active profile, `?`, Ctrl+C.
+- `TUIZIUM_LOG=debug` log, CLI and UI: no password, plain or base64 (Basic auth), in the log file.
+Not checked: a multi-worker cluster, Linux/macOS, a real terminal emulator, profile removal beyond the unit test, OSC 52 delivery.
+
+- **Stop** (`S`, `tuizium stop <name>... [--wait]`): `PUT /connectors/{name}/stop`. Needs Kafka Connect 3.5 or newer; the version comes
+  from `GET /`, and an unknown or older version refuses with a message (use pause instead) rather than sending the request.
+  The journal confirms `STOPPED` only when the connector reports it. `u` / `resume` brings a stopped connector back.
+- **Read-only mode**: `--read-only`, or `read_only = true` in a profile. Every key that changes a cluster (`p u S R F d e n t`) and every
+  changing command (`pause resume stop restart create update`) is refused; `list`, `status` and `--dry-run` still work. The header shows `READ-ONLY`.
+  The refusal is also enforced at the single place all UI changes pass through, not only at the keys.
+- **Debezium view** in the Overview panel for Debezium connectors: include/exclude lists (with entry counts), `snapshot.mode`,
+  `slot.name`, `publication.name` and family-specific settings for PostgreSQL, MySQL/MariaDB, SQL Server, Oracle, MongoDB, other sources and the Debezium JDBC / MongoDB sinks.
+  It is read from the connector config only and says so on screen: Tuizium does not read the database, the replication slot or snapshot progress.
+  `snapshot.mode`, `slot.name` and `publication.name` show "not set in config" when absent.
+- **Profile removal**: `c`, then `d` on a profile, then `y`. The profile in use and the last remaining profile cannot be removed; environment variables are never touched.
+- **Fix (security):** a password inside URL user-info (`mongodb://user:password@host/db`, `jdbc:...://user:password@host`) was shown in clear in the
+  Overview, Config panel and CLI output. It is now masked everywhere other secrets are. This also affected 1.2.0 and earlier.
+- **Dependencies:** `rustls` 0.23.45 → 0.23.46 (lockfile only) for RUSTSEC-2026-0346 to -0349 (TLS secrets in `Debug` output, ECH, Brotli
+  certificate decompression, ServerHello downgrade). `cargo audit` reports no advisories afterwards; `cargo deny` passes advisories, licenses, bans and sources.
+
 ## 1.2.0 — scripting (roadmap v1.2)
 
 Non-interactive subcommands, for scripts and CI. No terminal is needed; output is plain text or JSON, never ANSI colour.

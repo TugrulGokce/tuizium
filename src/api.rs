@@ -29,6 +29,23 @@ pub struct RootInfo {
     pub version: String,
 }
 
+impl RootInfo {
+    /// `(major, minor)` parsed from the `GET /` version string, e.g. `3.9.0` or `3.5.1-SNAPSHOT`.
+    pub fn version_pair(&self) -> Option<(u32, u32)> {
+        let mut parts = self.version.trim().split('.');
+        let major = parts.next()?.parse().ok()?;
+        let minor =
+            parts.next()?.chars().take_while(char::is_ascii_digit).collect::<String>().parse().ok()?;
+        Some((major, minor))
+    }
+
+    /// Whether `PUT /connectors/{name}/stop` exists (added in Kafka Connect 3.5, KIP-875).
+    /// An unknown version counts as unsupported rather than guessing.
+    pub fn supports_stop(&self) -> bool {
+        self.version_pair().is_some_and(|v| v >= (3, 5))
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kind {
     Source,
@@ -455,6 +472,13 @@ impl Client {
         Ok(())
     }
 
+    /// `PUT /connectors/{name}/stop` (Connect 3.5+): stops the connector and removes its tasks.
+    pub async fn stop(&self, name: &str) -> Result<()> {
+        check_name(name)?;
+        self.send(self.http.put(self.url(&["connectors", name, "stop"]))).await?;
+        Ok(())
+    }
+
     pub async fn resume(&self, name: &str) -> Result<()> {
         check_name(name)?;
         self.send(self.http.put(self.url(&["connectors", name, "resume"]))).await?;
@@ -580,6 +604,7 @@ mod tests {
         c.delete("a").await.unwrap();
         c.restart("b", true).await.unwrap();
         c.update_config("a", &Map::new()).await.unwrap();
+        c.stop("a").await.unwrap();
         let heads: Vec<String> =
             seen.lock().unwrap().iter().map(|r| r.lines().next().unwrap().to_string()).collect();
         assert_eq!(heads[0], "PUT /connectors/my%20conn/pause HTTP/1.1");
@@ -589,7 +614,21 @@ mod tests {
         assert_eq!(heads[4], "DELETE /connectors/a HTTP/1.1");
         assert_eq!(heads[5], "POST /connectors/b/restart?includeTasks=true&onlyFailed=true HTTP/1.1");
         assert_eq!(heads[6], "PUT /connectors/a/config HTTP/1.1");
+        assert_eq!(heads[7], "PUT /connectors/a/stop HTTP/1.1");
         assert!(seen.lock().unwrap()[0].to_ascii_lowercase().contains("authorization: basic"));
+    }
+
+    #[test]
+    fn stop_capability_follows_connect_version() {
+        let root = |v: &str| RootInfo { version: v.into() };
+        assert!(root("3.9.0").supports_stop());
+        assert!(root("3.5.0").supports_stop());
+        assert!(root("4.0.1").supports_stop());
+        assert!(root("3.10.2-SNAPSHOT").supports_stop());
+        assert!(!root("3.4.1").supports_stop());
+        assert!(!root("2.8.0").supports_stop());
+        assert!(!root("").supports_stop());
+        assert!(!root("weird").supports_stop());
     }
 
     const VALIDATION: &str = r#"{"name":"X","error_count":1,"groups":[],"configs":[
